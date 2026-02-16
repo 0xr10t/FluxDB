@@ -1,0 +1,1 @@
+pub const MAX_PAGE_SIZE: u64 = 4 * 1024; // 4KB, Maybe 8KB, 16KB, etc, will have to check 

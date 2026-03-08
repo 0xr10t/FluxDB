@@ -4,4 +4,4 @@ members = ["crates/*"]
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
-db_common = { path = "crates/common" }
+common = { path = "crates/common" }

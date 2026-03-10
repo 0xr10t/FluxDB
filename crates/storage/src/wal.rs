@@ -26,10 +26,13 @@ pub struct Wal {
 
 impl Wal {
     // Append log to Wal
+    // Add checksum to end of log (hash of log)
     pub fn append() -> Result<> {}
 
     // Sync the Wal to disk
+    // Ensure WAL is durable upto lsn
     //* Should be atomic */
     // Called before writing dirty page from buffer pool to disk
-    pub fn sync() {}
+    // make
+    pub fn sync(lsn: Lsn) {}
 }

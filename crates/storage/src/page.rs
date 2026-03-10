@@ -55,6 +55,10 @@ impl LeafPage {
 
     // insert, update, get, delete functions
     // helpers to serialize and deserialize, get free space in page, etc
+
+    // Add a LeafPage::from_bytes([&u8]) which deserializes and gives a leaf page
+    // from bytes buffer. Can use a flag to mark if page is Leaf or Internal while
+    // serializing.
 }
 
 pub struct InternalPage {

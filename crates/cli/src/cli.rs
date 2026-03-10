@@ -15,7 +15,7 @@ pub enum Command {
     /// Query records (eventually maps to B+Tree lookups / range scans).
     Select(SelectArgs),
 
-    /// Update a record by primary key.
+    // Update a record by primary key.
     // Update(UpdateArgs),
 
     // Good future additions for an OLTP DB CLI:

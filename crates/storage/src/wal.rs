@@ -34,5 +34,5 @@ impl Wal {
     //* Should be atomic */
     // Called before writing dirty page from buffer pool to disk
     // make
-    pub fn sync(lsn: Lsn) {}
+    pub fn flush(lsn: Lsn) {}
 }

@@ -1,10 +1,12 @@
 use crc32fast::Hasher;
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::vec;
 
+use crate::disk::sync_file_to_disk;
 use crate::page::Lsn;
 
 #[derive(Debug)]
@@ -55,7 +57,7 @@ impl TryFrom<u8> for WalEntryType {
 }
 
 pub struct WalEntry {
-    pub next_lsn: Lsn,
+    pub lsn: Lsn,
     pub entry_type: WalEntryType,
     pub key: Vec<u8>,
     pub value: Option<Vec<u8>>,
@@ -78,7 +80,89 @@ impl Iterator for WalIterator {
     type Item = Result<WalEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        let mut lsn_buf = [0u8; 8];
+        if let Err(e) = self.reader.read_exact(&mut lsn_buf) {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                return None;
+            }
+            return Some(Err(e.into()));
+        }
+        let lsn = Lsn::from_le_bytes(lsn_buf);
+
+        let mut type_buf = [0u8; 1];
+        if let Err(e) = self.reader.read_exact(&mut type_buf) {
+            return Some(Err(e.into()));
+        }
+        let entry_type = match WalEntryType::try_from(type_buf[0]) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let mut key_len_buf = [0u8; 8];
+        if let Err(e) = self.reader.read_exact(&mut key_len_buf) {
+            return Some(Err(e.into()));
+        }
+        let key_len = u64::from_le_bytes(key_len_buf);
+
+        let mut value_len_buf = [0u8; 8];
+        if let Err(e) = self.reader.read_exact(&mut value_len_buf) {
+            return Some(Err(e.into()));
+        }
+        let value_len = u64::from_le_bytes(value_len_buf);
+
+        let mut timestamp_buf = [0u8; 8];
+        if let Err(e) = self.reader.read_exact(&mut timestamp_buf) {
+            return Some(Err(e.into()));
+        }
+        let timestamp = u64::from_le_bytes(timestamp_buf);
+
+        let mut key = vec![0u8; key_len as usize];
+        if let Err(e) = self.reader.read_exact(&mut key) {
+            return Some(Err(e.into()));
+        }
+
+        let value = if value_len > 0 {
+            let mut val_buf = vec![0u8; value_len as usize];
+            if let Err(e) = self.reader.read_exact(&mut val_buf) {
+                return Some(Err(e.into()));
+            }
+            Some(val_buf)
+        } else {
+            None
+        };
+
+        let mut checksum_buf = [0u8; 4];
+        if let Err(e) = self.reader.read_exact(&mut checksum_buf) {
+            return Some(Err(e.into()));
+        }
+        let expected_checksum = u32::from_le_bytes(checksum_buf);
+
+        let mut hasher = Hasher::new();
+        hasher.update(&lsn_buf);
+        hasher.update(&type_buf);
+        hasher.update(&key_len_buf);
+        hasher.update(&value_len_buf);
+        hasher.update(&timestamp_buf);
+        hasher.update(&key);
+        if let Some(ref v) = value {
+            hasher.update(v);
+        }
+        let actual_checksum = hasher.finalize();
+
+        if actual_checksum != expected_checksum {
+            return Some(Err(WalError::CorruptedLog(format!(
+                "Checksum mismatch for LSN {}: expected {}, got {}",
+                lsn, expected_checksum, actual_checksum
+            ))));
+        }
+
+        Some(Ok(WalEntry {
+            lsn,
+            entry_type,
+            key,
+            value,
+            timestamp,
+        }))
     }
 }
 
@@ -134,6 +218,7 @@ impl Wal {
 
     pub fn flush(&mut self) -> Result<()> {
         self.file.flush()?;
+        sync_file_to_disk();
         Ok(())
     }
 }

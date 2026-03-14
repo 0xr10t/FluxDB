@@ -1,9 +1,9 @@
 use crc32fast::Hasher;
+use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::fmt::{Display, Formatter};
 
 use crate::page::Lsn;
 
@@ -46,7 +46,10 @@ impl TryFrom<u8> for WalEntryType {
         match value {
             0 => Ok(WalEntryType::Put),
             1 => Ok(WalEntryType::Delete),
-            _ => Err(WalError::CorruptedLog(format!("Invalid entry type: {}", value))),
+            _ => Err(WalError::CorruptedLog(format!(
+                "Invalid entry type: {}",
+                value
+            ))),
         }
     }
 }
@@ -89,14 +92,23 @@ impl WalIterator {
 }
 
 impl Wal {
-    pub fn append(&mut self, lsn: Lsn, entry_type: WalEntryType, key: &[u8], value: Option<&[u8]>) -> Result<Lsn> {
+    pub fn append(
+        &mut self,
+        lsn: Lsn,
+        entry_type: WalEntryType,
+        key: &[u8],
+        value: Option<&[u8]>,
+    ) -> Result<Lsn> {
         let next_lsn = lsn + 1;
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| WalError::CorruptedLog(e.to_string()))?.as_micros() as u64;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| WalError::CorruptedLog(e.to_string()))?
+            .as_micros() as u64;
         let key_len = key.len() as u64;
         let value_bytes = match entry_type {
-            WalEntryType::Put => value.ok_or_else(|| {
-                WalError::CorruptedLog("Put entry missing value".into())
-            })?,
+            WalEntryType::Put => {
+                value.ok_or_else(|| WalError::CorruptedLog("Put entry missing value".into()))?
+            }
             WalEntryType::Delete => &[],
         };
         let value_len = value_bytes.len() as u64;
@@ -115,8 +127,8 @@ impl Wal {
         hasher.update(&record);
         let checksum = hasher.finalize();
 
-        self.file.write(&record)?;
-        self.file.write(&checksum.to_le_bytes())?;
+        self.file.write_all(&record)?;
+        self.file.write_all(&checksum.to_le_bytes())?;
         Ok(next_lsn)
     }
 
@@ -125,4 +137,3 @@ impl Wal {
         Ok(())
     }
 }
-

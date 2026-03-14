@@ -51,7 +51,9 @@ pub struct LeafPage {
 }
 
 impl LeafPage {
-    pub new() -> Self {}
+    pub fn new() -> Self {
+        todo!()
+    }
 
     // insert, update, get, delete functions
     // helpers to serialize and deserialize, get free space in page, etc
@@ -66,5 +68,7 @@ pub struct InternalPage {
 }
 
 impl InternalPage {
-    pub new() -> Self {}
+    pub fn new() -> Self {
+        todo!()
+    }
 }

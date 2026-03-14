@@ -14,7 +14,6 @@ use clap::{Args, Parser, Subcommand};
 pub enum Command {
     /// Query records (eventually maps to B+Tree lookups / range scans).
     Select(SelectArgs),
-
     // Update a record by primary key.
     // Update(UpdateArgs),
 

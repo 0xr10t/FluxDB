@@ -1,3 +1,25 @@
+//! # Write-Ahead Log (WAL)
+//!
+//! The WAL is a crucial component for ensuring Database durability and atomicity.
+//! It records all changes to the database before they are applied to the data files.
+//! This implementation provides:
+//! -   **Durability**: Changes are flushed to disk before completion.
+//! -   **Checksumming**: Every record is protected by a CRC32 checksum to detect corruption.
+//! -   **Sequential I/O**: Optimized for append-only writes.
+//!
+//! ## Record Layout
+//!
+//! | Field      | Size (bytes) | Description                          |
+//! |------------|--------------|--------------------------------------|
+//! | LSN        | 8            | Log Sequence Number (Little Endian) |
+//! | Type       | 1            | Entry type (0: Put, 1: Delete)        |
+//! | Key Len    | 8            | Length of the key                    |
+//! | Value Len  | 8            | Length of the value (0 if None)      |
+//! | Timestamp  | 8            | Microseconds since Unix Epoch        |
+//! | Key        | variable     | The actual key bytes                 |
+//! | Value      | variable     | The actual value bytes (optional)    |
+//! | Checksum   | 4            | CRC32 of all preceding fields        |
+
 use crc32fast::Hasher;
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};

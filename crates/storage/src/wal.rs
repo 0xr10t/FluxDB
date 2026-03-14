@@ -1,8 +1,8 @@
 use crc32fast::Hasher;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::fmt::{Display, Formatter};
 
 use crate::page::Lsn;
@@ -52,12 +52,15 @@ impl TryFrom<u8> for WalEntryType {
 }
 
 pub struct WalEntry {
-    pub lsn: Lsn,
+    pub next_lsn: Lsn,
     pub entry_type: WalEntryType,
     pub key: Vec<u8>,
     pub value: Option<Vec<u8>>,
     pub timestamp: u64,
 }
+
+// Layout of a WAL record
+// | lsn | entry_type | key_len | value_len | timestamp | key_bytes | value_bytes | checksum |
 
 pub struct WalIterator {
     reader: BufReader<File>,
@@ -86,12 +89,40 @@ impl WalIterator {
 }
 
 impl Wal {
-    pub fn append(&mut self) -> Result<Lsn> {
-        todo!()
+    pub fn append(&mut self, lsn: Lsn, entry_type: WalEntryType, key: &[u8], value: Option<&[u8]>) -> Result<Lsn> {
+        let next_lsn = lsn + 1;
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| WalError::CorruptedLog(e.to_string()))?.as_micros() as u64;
+        let key_len = key.len() as u64;
+        let value_bytes = match entry_type {
+            WalEntryType::Put => value.ok_or_else(|| {
+                WalError::CorruptedLog("Put entry missing value".into())
+            })?,
+            WalEntryType::Delete => &[],
+        };
+        let value_len = value_bytes.len() as u64;
+
+        let mut record = Vec::new();
+
+        record.extend_from_slice(&lsn.to_le_bytes());
+        record.push(entry_type as u8);
+        record.extend_from_slice(&key_len.to_le_bytes());
+        record.extend_from_slice(&value_len.to_le_bytes());
+        record.extend_from_slice(&timestamp.to_le_bytes());
+        record.extend_from_slice(key);
+        record.extend_from_slice(value_bytes);
+
+        let mut hasher = Hasher::new();
+        hasher.update(&record);
+        let checksum = hasher.finalize();
+
+        self.file.write(&record)?;
+        self.file.write(&checksum.to_le_bytes())?;
+        Ok(next_lsn)
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        todo!()
+        self.file.flush()?;
+        Ok(())
     }
 }
 

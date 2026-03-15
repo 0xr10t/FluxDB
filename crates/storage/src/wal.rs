@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::vec;
 
-use crate::disk::sync_file_to_disk;
+use crate::disk::DiskManager;
 use crate::page::Lsn;
 
 #[derive(Debug)]
@@ -270,7 +270,7 @@ impl Wal {
 
     pub fn flush(&mut self) -> Result<()> {
         self.file.flush()?;
-        sync_file_to_disk();
+        DiskManager::sync_file_and_dir(self.file.get_ref(), &self.path);
         Ok(())
     }
 }

@@ -38,8 +38,5 @@ impl DiskManager {
     // - fsync temp
     // - rename over destination (atomic on same filesystem)
     // - fsync parent directory
-}
-
-pub fn sync_file_to_disk() {
-    //Placeholder for now
+    pub fn sync_file_and_dir(file: &File, file_path: &Path) {}
 }

@@ -1,7 +1,7 @@
 //! Functionality for managing B+Tree
 //! Sort according to a key, add nodes, traverse the tree
 //! to find result to a query, etc.
-//! 
+//!
 //! Responsibilities (this module):
 //! - Provide a stable API: get/insert/delete/range_scan.
 //! - Navigate from root -> leaf using internal pages.
@@ -10,10 +10,7 @@
 
 use std::sync::Arc;
 
-use crate::{
-    buffer_pool::BufferPool,
-    page::PageId,
-};
+use crate::{buffer_pool::BufferPool, page::PageId};
 
 #[derive(Debug)]
 pub enum IndexError {}
@@ -34,20 +31,28 @@ pub struct BTreeMeta {
 }
 
 /// B+Tree index (keys -> inline row bytes).
-pub struct BTreeIndex<> {
+pub struct BTreeIndex {
     pool: Arc<BufferPool>,
     meta: BTreeMeta,
 }
 
-impl<C: KeyCmp> BTreeIndex<C> {
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {}
+impl BTreeIndex {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        todo!()
+    }
 
     /// Insert (key -> row_bytes).
-    pub fn insert(&self, key: &[u8], row: &[u8]) -> Result<()> {}
+    pub fn insert(&self, key: &[u8], row: &[u8]) -> Result<()> {
+        todo!()
+    }
 
     /// Delete a key.
-    pub fn delete(&self, key: &[u8]) -> Result<()> {}
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        todo!()
+    }
 
     /// Traverse internal nodes to find the leaf that should contain `key`.
-    fn find_leaf(&self, mut pid: PageId, key: &[u8]) -> Result<PageId> {}
+    fn find_leaf(&self, mut pid: PageId, key: &[u8]) -> Result<PageId> {
+        todo!()
+    }
 }

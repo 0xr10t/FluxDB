@@ -34,8 +34,9 @@ impl DiskManager {
     // - Write a page from bytes (must be page_size). Durable if you call `sync_data()` afterwards.
     // - sync_data() - Flush file data (Linux: similar to fdatasync via Rust's sync_data).
     // - Atomic write for small “whole file” updates (catalog/manifest):
-        // - write temp file
-        // - fsync temp
-        // - rename over destination (atomic on same filesystem)
-        // - fsync parent directory
+    // - write temp file
+    // - fsync temp
+    // - rename over destination (atomic on same filesystem)
+    // - fsync parent directory
+    pub fn sync_file_and_dir(file: &File, file_path: &Path) {}
 }

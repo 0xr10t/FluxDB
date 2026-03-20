@@ -118,7 +118,9 @@ Page size: 4096 bytes
 │                                                          │
 │  Starts at offset 40  (40 % 8 == 0 )                     │
 │  Each slot entry = 4 bytes (u16 offset + u16 length)     │
-│  slot[i].offset == 0  →  tombstone                       │
+│                                                          │
+│                                                          │
+│                                                          │
 │                                                          │
 │  slot[i] byte offset = 40 + i*4                          │
 │  Entries are 4-byte aligned throughout                   │

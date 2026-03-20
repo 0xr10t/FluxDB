@@ -716,8 +716,7 @@ impl<'a, K: Key, V: Value> LeafPageAccessor<'a, K, V> {
     // ── Record data access ────────────────────────────────────────────────
 
     /// Deserialised key at slot `i`.
-    /// Lifetime is 'a — the returned value may borrow directly from the page
-    /// buffer (zero-copy for slice-backed key types like &[u8]).
+    /// Lifetime is 'a — the returned value may borrow from the page
     pub fn get_key(&self, i: usize) -> K::SelfType<'a> {
         K::from_bytes(self.key_bytes_at(i))
     }
@@ -728,24 +727,17 @@ impl<'a, K: Key, V: Value> LeafPageAccessor<'a, K, V> {
     }
 
     /// Both key and value at slot `i` as a tuple.
-    ///
-    /// Mirrors redb's `LeafAccessor::entry()`. Having a combined call avoids
-    /// reading the slot twice when both halves are needed (e.g., during a
-    /// range scan that yields key-value pairs).
     pub fn entry(&self, i: usize) -> (K::SelfType<'a>, V::SelfType<'a>) {
         (self.get_key(i), self.get_value(i))
     }
 
     // ── Private helpers ───────────────────────────────────────────────────
 
-    /// Start offset of the record referenced by slot `i`.
+    /// gives offset of record referenced by slot at index i
     fn slot_rec_base(&self, i: usize) -> usize {
         read_u16(self.data, slot_offset(i)) as usize
     }
 
-    /// Total allocated byte size of the record at slot `i` (header + key +
-    /// padding + value, rounded up). Stored in the high u16 of the slot entry
-    /// so compact() never has to re-derive it from the key/val lengths.
     fn slot_rec_size(&self, i: usize) -> usize {
         read_u16(self.data, slot_offset(i) + 2) as usize
     }
@@ -891,11 +883,6 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
     /// gap. The slot is updated to point at the new record; the old record's
     /// bytes become dead space that `compact()` can later reclaim.
     /// Returns `Err(InsufficientSpace)` when the free gap is too small.
-    ///
-    /// We keep insert and overwrite_value as separate methods (unlike redb's
-    /// unified `insert(pos, overwrite, key, val)`) because the same-size
-    /// optimisation is valuable enough to be explicit, and the two code paths
-    /// are different enough that merging them adds more complexity than it saves.
     pub fn overwrite_value(
         &mut self,
         pos:       usize,
@@ -931,17 +918,15 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
 
         // Copy the key bytes out before writing into the page, in case the
         // old and new record regions overlap.
-        let key_src  = rec_key_offset(rec_base);
-        let key_copy: Vec<u8> = self.data[key_src..key_src + key_len].to_vec();
-
-        let new_rec_base = free_end - new_rec_size;
+        let old_key_off = rec_key_offset(rec_base);
+        let new_rec_base   = free_end - new_rec_size;
 
         write_u16(self.data, new_rec_base + REC_OFF_KEY_LEN, key_len as u16);
         write_u16(self.data, new_rec_base + REC_OFF_VAL_LEN, new_val_len as u16);
         write_u8 (self.data, new_rec_base + REC_OFF_FLAGS,   0);
 
         let new_key_off = rec_key_offset(new_rec_base);
-        self.data[new_key_off..new_key_off + key_len].copy_from_slice(&key_copy);
+        self.data.copy_within(old_key_off..old_key_off+key_len, new_key_off);
 
         let new_val_off = rec_val_offset(new_rec_base, key_len);
         self.data[new_val_off..new_val_off + new_val_len].copy_from_slice(val_bytes);
@@ -961,9 +946,6 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
     /// shifted left by one, keeping the directory dense and sorted. The
     /// record's bytes in the data area are NOT erased — they become dead
     /// space. Call `compact()` to reclaim them.
-    ///
-    /// Keeping the slot directory dense (no tombstones) means binary search
-    /// and range scans never encounter gaps and need no special-case code.
     pub fn remove(&mut self, pos: usize) {
         let n          = read_u16(self.data, OFF_LEAF_SLOT_COUNT)  as usize;
         let free_start = read_u16(self.data, OFF_LEAF_FREE_START) as usize;
@@ -976,7 +958,7 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
             self.data.copy_within(src..src + len, src - SLOT_SIZE);
         }
 
-        // Zero the vacated last slot so stale bytes don't confuse debugging.
+        
         let vacated = slot_offset(n - 1);
         self.data[vacated..vacated + SLOT_SIZE].fill(0);
 
@@ -1019,6 +1001,7 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
 
         // Process record closest to PAGE_SIZE first so every destination is
         // clear when we write to it (nothing above has been moved yet).
+        // this sorts in descending order based on offsets. largest offsets come first as records grow from high-address-end(right side). 
         live.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
         let mut write_end = PAGE_SIZE;
@@ -1026,6 +1009,7 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
             write_end -= size;
             if old_base != write_end {
                 self.data.copy_within(old_base..old_base + size, write_end);
+                // store the offset in slot
                 write_u16(self.data, slot_offset(slot_idx), write_end as u16);
             }
         }

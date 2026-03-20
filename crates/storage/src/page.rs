@@ -31,7 +31,7 @@ pub const PAGE_SIZE: usize = 4096;
 │                                                          │
 │  Offset: 32                                              │
 │  32 % 8 == 0 ✓                                           │
-│  Each u64 entry keeps alignment since 8 % 8 == 0 ✓      │
+│  Each u64 entry keeps alignment since 8 % 8 == 0         │
 │                                                          │
 │  child[i] offset = 32 + i*8                              │
 └──────────────────────────────────────────────────────────┘
@@ -40,29 +40,22 @@ pub const PAGE_SIZE: usize = 4096;
 │ SECTION B — Key end offsets  [num_keys × 4 bytes]        │
 │                                                          │
 │  Offset: 32 + (num_keys+1)*8                             │
-│  (num_keys+1)*8 is always a multiple of 8                │
-│  so section B starts 8-byte aligned ✓                    │
-│  u32 needs 4-byte alignment; 8-byte aligned is finer ✓   │
 │                                                          │
-│  key_end[i] offset = 32 + (num_keys+1)*8 + i*4          │
+│                                                          │
+│                                                          │
+│                                                          │
+│  key_end[i] offset = 32 + (num_keys+1)*8 + i*4           │
 │  key_end[i] stores: exclusive end of key[i] in           │
 │  Section C, relative to Section C start                  │
 └──────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────┐
-│ SECTION B→C PADDING  [0 or 4 bytes]                      │
-│                                                          │
-│  Section B is num_keys*4 bytes long.                     │
-│  If num_keys is odd → B ends on a 4-byte boundary,       │
-│  not 8. Add 4 bytes of padding to realign.               │
-│                                                          │
-│  pad = (num_keys % 2 == 1) ? 4 : 0                       │
-└──────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────┐
 │ SECTION C — Key data  [variable, packed bytes]           │
 │                                                          │
-│  Raw key bytes need no alignment (they are [u8]).        │
+│  Starts immediately after Section B — no padding needed  │
+│  since key data is raw bytes ([u8]) with no alignment    │
+│  requirement. Every access uses from_le_bytes / slices.  │
+│                                                          │
 │  key[i] spans [key_end[i-1], key_end[i])                 │
 │  (key_end[-1] is defined as 0)                           │
 └──────────────────────────────────────────────────────────┘
@@ -95,10 +88,11 @@ fn int_key_end_section(num_keys: usize) -> usize {
 fn int_key_end_offset(num_keys: usize, i: usize) -> usize {
     int_key_end_section(num_keys) + i * 4
 }
-// returns the start of offset where key data is stored 
+// returns the start of offset where key data is stored.
+// Section C starts immediately after Section B — no padding needed since
+// key data is raw bytes ([u8]) with no alignment requirement.
 fn int_key_data_base(num_keys: usize) -> usize {
-    let pad = if num_keys % 2 == 1 { 4 } else { 0 };
-    int_key_end_section(num_keys) + num_keys * 4 + pad
+    int_key_end_section(num_keys) + num_keys * 4
 }
 
 /*
@@ -106,28 +100,28 @@ Page size: 4096 bytes
 
 ┌─────────────────────────────────────────────────────────┐
 │ FIXED HEADER — 40 bytes (fully 8-byte aligned)          │
-├────────┬───────────┬───────────────────────────────────  ┤
-│ Off  0 │ u8        │ page_type                           │
-│ Off  1 │ u8        │ flags                               │
-│ Off  2 │ u16       │ slot_count                          │
-│ Off  4 │ u16       │ free_start  (end of slot directory) │
-│ Off  6 │ u16       │ free_end    (start of record area)  │
-├────────┼───────────┼───────────────────────────────────  ┤
-│ Off  8 │ u64       │ page_id          [8-byte aligned ✓] │
-│ Off 16 │ u64       │ lsn              [8-byte aligned ✓] │
-│ Off 24 │ u64       │ prev_page        [8-byte aligned ✓] │
-│ Off 32 │ u64       │ next_page        [8-byte aligned ✓] │
-└────────┴───────────┴───────────────────────────────────  ┘
+├────────┬───────────┬─────────────────────────────────── ┤
+│ Off  0 │ u8        │ page_type                          │
+│ Off  1 │ u8        │ flags                              │
+│ Off  2 │ u16       │ slot_count                         │
+│ Off  4 │ u16       │ free_start  (end of slot directory)│
+│ Off  6 │ u16       │ free_end    (start of record area) │
+├────────┼───────────┼─────────────────────────────────── ┤
+│ Off  8 │ u64       │ page_id          [8-byte aligned ] │
+│ Off 16 │ u64       │ lsn              [8-byte aligned ] │
+│ Off 24 │ u64       │ prev_page        [8-byte aligned ] │
+│ Off 32 │ u64       │ next_page        [8-byte aligned ] │
+└────────┴───────────┴─────────────────────────────────── ┘
 
 ┌──────────────────────────────────────────────────────────┐
 │ SLOT DIRECTORY  [slot_count × 4 bytes, grows →]          │
 │                                                          │
-│  Starts at offset 40  (40 % 8 == 0 ✓)                   │
+│  Starts at offset 40  (40 % 8 == 0 )                     │
 │  Each slot entry = 4 bytes (u16 offset + u16 length)     │
 │  slot[i].offset == 0  →  tombstone                       │
 │                                                          │
 │  slot[i] byte offset = 40 + i*4                          │
-│  Entries are 4-byte aligned throughout ✓                 │
+│  Entries are 4-byte aligned throughout                   │
 └──────────────────────────────────────────────────────────┘
 
          ↕  free space (free_end - free_start bytes)
@@ -137,14 +131,14 @@ Page size: 4096 bytes
 │                                                          │
 │  Each record layout (fixed header first, data second):   │
 │  ┌──────┬──────┬───────┬─────────────────────────────┐   │
-│  │ u16  │ u16  │ u8    │ u8 pad │ key bytes │ val bytes│  │
-│  │k_len │v_len │ flags │        │           │          │  │
+│  │ u16  │ u16  │ u8    │ u8 pad │ key bytes │ val bytes│ │
+│  │k_len │v_len │ flags │        │           │          │ │
 │  └──────┴──────┴───────┴─────────────────────────────┘   │
-│    2B     2B     1B      1B       k_len B    v_len B      │
+│    2B     2B     1B      1B       k_len B    v_len B     │
 │                                                          │
 │  Fixed record header = 6 bytes, padded to 8 bytes total  │
 │  Allocation always rounded up to nearest 2 bytes so      │
-│  every record starts at an even offset ✓                 │
+│  every record starts at an even offset                   │
 │                                                          │
 │  key_len + val_len + 8 (overhead) per record             │
 └──────────────────────────────────────────────────────────┘
@@ -337,12 +331,9 @@ impl<'a, K: Key> InternalPageAccessor<'a, K> {
             read_u32(self.data, int_key_end_offset(n, n - 1)) as usize
         };
 
-        let pad = if n % 2 == 1 { 4 } else { 0 };
-
         INT_HEADER_SIZE
             + (n + 1) * 8   // Section A: child page IDs
             + n * 4          // Section B: key end offsets
-            + pad            // Section B→C padding
             + key_data_size  // Section C: key data
     }
 
@@ -351,22 +342,11 @@ impl<'a, K: Key> InternalPageAccessor<'a, K> {
     }
 
     pub fn can_fit(&self, key_len: usize) -> bool {
-        let n = self.num_keys() as usize;
-
-        // Padding before and after adding one key
-        let current_pad = if n % 2 == 1 { 4 } else { 0 };
-        let new_pad   :usize  = if (n + 1) % 2 == 1 { 4 } else { 0 };
-
         // Space needed for one more key+child:
         //   8 bytes  → one more child page ID (Section A)
         //   4 bytes  → one more key_end entry (Section B)
-        //   -4 or 4   → padding may grow depending on parity
         //   key_len  → the actual key bytes (Section C)
-        let pad_delta = new_pad as isize - current_pad as isize;
-
         let needed = 8 + 4 + key_len;
-        let needed = (needed as isize + pad_delta) as usize;
-
         self.free_bytes() >= needed
     }
 

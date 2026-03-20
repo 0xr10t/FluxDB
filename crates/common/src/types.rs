@@ -1,4 +1,5 @@
 use std::fmt::Debug; 
+use std::mem::size_of;
 use std::cmp::Ordering; 
 #[derive(Eq, PartialEq, Debug, Clone)]
 enum TypeClassification {

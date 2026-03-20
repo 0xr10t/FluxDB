@@ -310,7 +310,7 @@ impl<'a, K: Key> InternalPageAccessor<'a, K> {
     }
 
     // Returns raw bytes for key[i]. Lifetime is 'a — tied to the page data,
-    // not to &self — so key_at can hand the slice straight to K::from_bytes.   1`4tgb`
+    // not to &self — so key_at can hand the slice straight to K::from_bytes. 
     fn key_bytes_at(&self, i: usize) -> &'a [u8] {
         let n    = self.num_keys() as usize;
         let base = int_key_data_base(n);

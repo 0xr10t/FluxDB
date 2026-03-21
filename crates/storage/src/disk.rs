@@ -40,7 +40,6 @@ pub struct DiskManager {
 
 impl DiskManager {
     // Functions to:
-    // - sync_data() - Flush file data (Linux: similar to fdatasync via Rust's sync_data).
     // - Atomic write for small “whole file” updates (catalog/manifest):
     // - write temp file
     // - fsync temp
@@ -109,6 +108,10 @@ impl DiskManager {
         Ok(())
     }
 
+    /// Flushes file data to disk (fdatasync).
+    // - sync_data() - Flush file data (Linux: similar to fdatasync via Rust's sync_data).
+    pub fn sync_data(&self) -> Result<()> {
+        self.file.sync_data()?;
         Ok(())
     }
 

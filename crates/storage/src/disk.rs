@@ -3,7 +3,7 @@
 
 use std::{
     fs::{self, File, OpenOptions},
-    io,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -39,13 +39,6 @@ pub struct DiskManager {
 }
 
 impl DiskManager {
-    // Functions to:
-    // - Atomic write for small “whole file” updates (catalog/manifest):
-    // - write temp file
-    // - fsync temp
-    // - rename over destination (atomic on same filesystem)
-    // - fsync parent directory
-
     // - Open or create the database file.
     pub fn new(path: impl AsRef<Path>, page_size: usize) -> Result<Self> {
         let file = OpenOptions::new()
@@ -112,6 +105,30 @@ impl DiskManager {
     // - sync_data() - Flush file data (Linux: similar to fdatasync via Rust's sync_data).
     pub fn sync_data(&self) -> Result<()> {
         self.file.sync_data()?;
+        Ok(())
+    }
+
+    // - Atomic write for small “whole file” updates (catalog/manifest):
+    // - write temp file
+    // - fsync temp
+    // - rename over destination (atomic on same filesystem)
+    // - fsync parent directory
+    pub fn atomic_write_file(&self, path: &Path, data: &[u8]) -> Result<()> {
+        let temp_path = path.with_extension("tmp");
+
+        let mut f = File::create(&temp_path)?;
+        f.write_all(data)?;
+
+        f.sync_all()?;
+        drop(f);
+
+        fs::rename(&temp_path, path)?;
+
+        if let Some(parent) = path.parent() {
+            let dir = File::open(parent)?;
+            dir.sync_all()?;
+        };
+
         Ok(())
     }
 

@@ -9,11 +9,11 @@ use std::{
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
-// #[cfg(windows)]
-// use std::os::windows::fs::FileExt;
 
 pub type PageId = u64;
 
+/// Errors that can occur during disk operations.
+#[derive(Debug)]
 pub enum DiskError {
     Io(io::Error),
     InvalidPageSize,
@@ -40,7 +40,6 @@ pub struct DiskManager {
 
 impl DiskManager {
     // Functions to:
-    // - Write a page from bytes (must be page_size). Durable if you call `sync_data()` afterwards.
     // - sync_data() - Flush file data (Linux: similar to fdatasync via Rust's sync_data).
     // - Atomic write for small “whole file” updates (catalog/manifest):
     // - write temp file
@@ -79,17 +78,37 @@ impl DiskManager {
 
         #[cfg(unix)]
         self.file.read_exact_at(buffer, offset)?;
-        // #[cfg(windows)]
-        // self.file.seek_read(buffer, offset)?;
-        //
-        // #[cfg(not(unix))]
-        // {
-        //     // this is not even thread safe
-        //     use std::io::{Read, Seek, SeekFrom};
-        //     let mut file = &self.file;
-        //     file.seek(SeekFrom::Start(offset))?;
-        //     file.read_exact(buffer)?;
-        // }
+        #[cfg(not(unix))]
+        {
+            // this is not as threadsafe as pread
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = &self.file;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(buffer)?;
+        }
+        Ok(())
+    }
+
+    // - Write a page from bytes (must be page_size). Durable if you call `sync_data()` afterwards.
+    pub fn write_page(&self, page_id: PageId, data: &[u8]) -> Result<()> {
+        if data.len() != self.page_size {
+            return Err(DiskError::InvalidPageSize);
+        }
+        let offset = page_id * self.page_size as u64;
+
+        #[cfg(unix)]
+        self.file.write_all_at(data, offset)?;
+        #[cfg(not(unix))]
+        {
+            // this is not even as threadsafe as pwrite
+            use std::io::{Seek, SeekFrom};
+            let mut file = &self.file;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(data)?;
+        }
+        Ok(())
+    }
+
         Ok(())
     }
 

@@ -132,5 +132,13 @@ impl DiskManager {
         Ok(())
     }
 
-    pub fn sync_file_and_dir(file: &File, file_path: &Path) {}
+    /// Flushes both the file and its parent directory to ensure metadata (rename/creation) is durable.
+    pub fn sync_file_and_dir(file: &File, file_path: &Path) -> Result<()> {
+        file.sync_all()?;
+        if let Some(parent) = file_path.parent() {
+            let dir = File::open(parent)?;
+            dir.sync_all()?;
+        }
+        Ok(())
+    }
 }

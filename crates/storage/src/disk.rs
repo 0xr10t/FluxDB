@@ -161,3 +161,112 @@ impl DiskManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    const PAGE_SIZE: usize = 4096;
+
+    fn make_manager(name: &str) -> (DiskManager, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(name);
+        let dm = DiskManager::new(&path, PAGE_SIZE).unwrap();
+        (dm, dir)
+    }
+
+    #[test]
+    fn write_and_read_page_roundtrip() {
+        let (dm, _dir) = make_manager("db.bin");
+        let data: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 256) as u8).collect();
+
+        dm.write_page(0, &data).unwrap();
+
+        let mut buf = vec![0u8; PAGE_SIZE];
+        dm.read_page(0, &mut buf).unwrap();
+
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn multiple_pages_are_independent() {
+        let (dm, _dir) = make_manager("db.bin");
+        let page0 = vec![1u8; PAGE_SIZE];
+        let page1 = vec![2u8; PAGE_SIZE];
+
+        dm.write_page(0, &page0).unwrap();
+        dm.write_page(1, &page1).unwrap();
+
+        let mut buf = vec![0u8; PAGE_SIZE];
+        dm.read_page(0, &mut buf).unwrap();
+        assert_eq!(buf, page0);
+
+        dm.read_page(1, &mut buf).unwrap();
+        assert_eq!(buf, page1);
+    }
+
+    #[test]
+    fn write_rejects_wrong_size_buffer() {
+        let (dm, _dir) = make_manager("db.bin");
+        let bad = vec![0u8; PAGE_SIZE - 1];
+        assert!(matches!(
+            dm.write_page(0, &bad),
+            Err(DiskError::InvalidPageSize)
+        ));
+    }
+
+    #[test]
+    fn read_rejects_wrong_size_buffer() {
+        let (dm, _dir) = make_manager("db.bin");
+        let data = vec![0u8; PAGE_SIZE];
+        dm.write_page(0, &data).unwrap();
+
+        let mut bad = vec![0u8; PAGE_SIZE + 1];
+        assert!(matches!(
+            dm.read_page(0, &mut bad),
+            Err(DiskError::InvalidPageSize)
+        ));
+    }
+
+    #[test]
+    fn overwrite_page_reflects_new_data() {
+        let (dm, _dir) = make_manager("db.bin");
+        let first = vec![0xAAu8; PAGE_SIZE];
+        let second = vec![0xBBu8; PAGE_SIZE];
+
+        dm.write_page(0, &first).unwrap();
+        dm.write_page(0, &second).unwrap();
+
+        let mut buf = vec![0u8; PAGE_SIZE];
+        dm.read_page(0, &mut buf).unwrap();
+        assert_eq!(buf, second);
+    }
+
+    #[test]
+    fn atomic_write_file_creates_and_replaces() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("db.bin");
+        let dm = DiskManager::new(&db_path, PAGE_SIZE).unwrap();
+
+        let target = dir.path().join("manifest.bin");
+        let v1 = b"version1";
+        dm.atomic_write_file(&target, v1).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), v1);
+
+        let v2 = b"version2";
+        dm.atomic_write_file(&target, v2).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), v2);
+
+        // temp file must not linger
+        assert!(!target.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn sync_data_does_not_error() {
+        let (dm, _dir) = make_manager("db.bin");
+        let data = vec![0u8; PAGE_SIZE];
+        dm.write_page(0, &data).unwrap();
+        assert!(dm.sync_data().is_ok());
+    }
+}

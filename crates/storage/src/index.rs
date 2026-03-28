@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use crate::{buffer_pool::BufferPool, page::PageId};
+use crate::{buffer_pool::BufferPoolManager, page::PageId};
 
 #[derive(Debug)]
 pub enum IndexError {}
@@ -32,7 +32,7 @@ pub struct BTreeMeta {
 
 /// B+Tree index (keys -> inline row bytes).
 pub struct BTreeIndex {
-    pool: Arc<BufferPool>,
+    pool: Arc<BufferPoolManager>,
     meta: BTreeMeta,
 }
 

@@ -1,5 +1,6 @@
 use crate::disk::DiskManager;
 use common::{MAX_FRAMES, MAX_PAGE_SIZE};
+use core::array::from_fn;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
@@ -14,9 +15,13 @@ pub enum BufferPoolError {
 impl Display for BufferPoolError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            BufferPoolError::PageNotFound(page_id) => write!(f, "Page with page id: {} not found", page_id),
+            BufferPoolError::PageNotFound(page_id) => {
+                write!(f, "Page with page id: {} not found", page_id)
+            }
             BufferPoolError::PinCountError => write!(f, "Pin count cannot be negative"),
-            BufferPoolError::NotEvictable(frame_id) => write!(f, "Frame id: {} is not evictable", frame_id),
+            BufferPoolError::NotEvictable(frame_id) => {
+                write!(f, "Frame id: {} is not evictable", frame_id)
+            }
             BufferPoolError::InternalError(msg) => write!(f, "Internal error: {}", msg),
         }
     }
@@ -59,7 +64,7 @@ impl ClockReplacer {
             self.hand = (self.hand + 1) % self.size;
             searched += 1;
         }
-        Err(BufferPoolError::NotEvictable(0)) 
+        Err(BufferPoolError::NotEvictable(0))
     }
 
     pub fn unpin(&mut self, frame_id: u64) {
@@ -75,9 +80,9 @@ impl ClockReplacer {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Page {
-    pub id: u64, 
+    pub id: u64,
     pub pin_count: u64,
     pub is_dirty: bool,
     pub data: [u8; MAX_PAGE_SIZE],
@@ -112,12 +117,20 @@ impl BufferPoolManager {
 
         Self {
             disk_manager,
-            pages: [Page::new(); MAX_FRAMES],
+            pages: from_fn(|_| Page::new()),
             replacer: ClockReplacer::new(MAX_FRAMES),
             free_list,
             page_table: HashMap::with_capacity(MAX_FRAMES),
             next_page_id: 0,
         }
+    }
+
+    pub fn page(&self, frame_id: u64) -> &Page {
+        &self.pages[frame_id as usize]
+    }
+
+    pub fn page_mut(&mut self, frame_id: u64) -> &mut Page {
+        &mut self.pages[frame_id as usize]
     }
 
     fn find_frame(&mut self) -> Result<u64> {
@@ -126,64 +139,70 @@ impl BufferPoolManager {
         } else {
             let victim_idx = self.replacer.victim()?;
             let victim_page = &mut self.pages[victim_idx as usize];
-            
+
             if victim_page.is_dirty {
-                self.disk_manager.write_page(victim_page.id, &victim_page.data)
+                self.disk_manager
+                    .write_page(victim_page.id, &victim_page.data)
                     .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
-                self.disk_manager.sync_data()
+                self.disk_manager
+                    .sync_data()
                     .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
             }
-            
+
             self.page_table.remove(&victim_page.id);
             Ok(victim_idx)
         }
     }
 
-    pub fn new_page(&mut self) -> Result<Page> {
+    pub fn new_page(&mut self) -> Result<u64> {
         let frame_id = self.find_frame()?;
         let page_id = self.next_page_id;
         self.next_page_id += 1;
 
-        let mut page = Page::new();
+        let page = &mut self.pages[frame_id as usize];
         page.id = page_id;
         page.pin_count = 1;
+        page.is_dirty = false;
+        page.data.fill(0);
 
-        self.pages[frame_id as usize] = page;
         self.page_table.insert(page_id, frame_id);
         self.replacer.pin(frame_id);
 
-        Ok(page)
+        Ok(frame_id)
     }
 
-    pub fn fetch_page(&mut self, page_id: u64) -> Result<Page> {
+    pub fn fetch_page(&mut self, page_id: u64) -> Result<u64> {
         if let Some(&frame_id) = self.page_table.get(&page_id) {
             let page = &mut self.pages[frame_id as usize];
             page.pin_count += 1;
             self.replacer.pin(frame_id);
-            return Ok(*page);
+            return Ok(frame_id);
         }
 
         let frame_id = self.find_frame()?;
-        let mut page = Page::new();
+        let page = &mut self.pages[frame_id as usize];
         page.id = page_id;
         page.pin_count = 1;
+        page.is_dirty = false;
 
-        self.disk_manager.read_page(page_id, &mut page.data)
+        self.disk_manager
+            .read_page(page_id, &mut page.data)
             .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
 
-        self.pages[frame_id as usize] = page;
         self.page_table.insert(page_id, frame_id);
         self.replacer.pin(frame_id);
 
-        Ok(page)
+        Ok(frame_id)
     }
 
     pub fn flush_page(&mut self, page_id: u64) -> Result<bool> {
         if let Some(&frame_id) = self.page_table.get(&page_id) {
             let page = &mut self.pages[frame_id as usize];
-            self.disk_manager.write_page(page.id, &page.data)
+            self.disk_manager
+                .write_page(page.id, &page.data)
                 .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
-            self.disk_manager.sync_data()
+            self.disk_manager
+                .sync_data()
                 .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
             page.is_dirty = false;
             Ok(true)
@@ -198,20 +217,6 @@ impl BufferPoolManager {
             self.flush_page(pid)?;
         }
         Ok(())
-    }
-
-    pub fn delete_page(&mut self, page_id: u64) -> Result<()> {
-        if let Some(&frame_id) = self.page_table.get(&page_id) {
-            let page = &self.pages[frame_id as usize];
-            if page.pin_count > 0 {
-                return Err(BufferPoolError::PinCountError);
-            }
-            self.page_table.remove(&page_id);
-            self.free_list.push(frame_id);
-            Ok(())
-        } else {
-            Err(BufferPoolError::PageNotFound(page_id))
-        }
     }
 
     pub fn unpin_page(&mut self, page_id: u64, is_dirty: bool) -> Result<()> {
@@ -239,19 +244,14 @@ mod tests {
     #[test]
     fn test_clock_replacer() {
         let mut replacer = ClockReplacer::new(3);
-        
         replacer.unpin(0);
         replacer.unpin(1);
         replacer.unpin(2);
-        
-        // Hand starts at 0.
-        // First victim: 0 (ref bit set to 1 by unpin, so it gets second chance)
-        // Rotation 1: 0(1->0), 1(1->0), 2(1->0)
-        // Rotation 2: 0(0->victim)
+
+        // Use victim to rotate the hand
         assert_eq!(replacer.victim().unwrap(), 0);
         assert_eq!(replacer.victim().unwrap(), 1);
-        
-        // Pin 2 so it can't be victim
+
         replacer.pin(2);
         assert_eq!(replacer.victim().unwrap(), 0);
     }

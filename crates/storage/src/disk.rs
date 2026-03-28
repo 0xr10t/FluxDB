@@ -39,4 +39,6 @@ impl DiskManager {
     // - rename over destination (atomic on same filesystem)
     // - fsync parent directory
     pub fn sync_file_and_dir(file: &File, file_path: &Path) {}
+
+    pub fn read_page() {}
 }

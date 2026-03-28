@@ -38,7 +38,23 @@ impl DiskManager {
     // - fsync temp
     // - rename over destination (atomic on same filesystem)
     // - fsync parent directory
-    pub fn sync_file_and_dir(file: &File, file_path: &Path) {}
+    pub fn new(db_path: PathBuf, page_size: usize) -> io::Result<Self> {
+        todo!()
+    }
 
-    pub fn read_page() {}
+    pub fn sync_data(&self) -> io::Result<()> {
+        todo!()
+    }
+
+    pub fn read_page(&self, page_id: PageId, buffer: &mut [u8]) -> io::Result<()> {
+        todo!()
+    }
+
+    pub fn write_page(&self, page_id: PageId, buffer: &[u8]) -> io::Result<()> {
+        todo!()
+    }
+
+    pub fn sync_file_and_dir(file: &File, _file_path: &Path) -> io::Result<()> {
+        todo!()
+    }
 }

@@ -1,5 +1,5 @@
-use crate::{disk::DiskManager, page};
-use common::{MAX_POOL_SIZE, MAX_PAGE_SIZE}; // TODO: NEED TO SEE ABOUT THIS SIZE
+use crate::{disk::DiskManager};
+use common::{MAX_FRAMES, MAX_PAGE_SIZE};
 use std::{collections::HashMap};
 use std::fmt::{Display, Formatter};
 
@@ -7,6 +7,8 @@ use std::fmt::{Display, Formatter};
 pub enum BufferPoolError {
     PageNotFound(u64),
     PinCountError,
+    NotEvictable(u64),
+    InternalError(String),
 }
 
 impl Display for BufferPoolError {
@@ -14,6 +16,8 @@ impl Display for BufferPoolError {
         match self {
             BufferPoolError::PageNotFound(page_id) => write!(f, "Page with page id: {} not found", page_id),
             BufferPoolError::PinCountError => write!(f, "Pin count cannot be negative"),
+            BufferPoolError::NotEvictable(frame_id) => write!(f, "Frame id: {} is not evictable from the free list", frame_id),
+            BufferPoolError::InternalError(msg) => write!(f, "Internal error: {}", msg),
         }
     }
 }
@@ -22,112 +26,208 @@ impl std::error::Error for BufferPoolError {}
 
 pub type Result<T> = std::result::Result<T, BufferPoolError>;
 
-#[derive(Clone, Copy)]
-struct PeriodicFlusher;
+#[derive(Debug)]
+struct ClockReplacer {
+    size: usize,
+    hand: usize,
+    ref_bits: Vec<bool>,
+    evictable: Vec<bool>,
+}
 
-impl PeriodicFlusher {
-    pub fn victim(self) -> u64 {
-        todo!()
+impl ClockReplacer {
+    pub fn new(size: usize) -> Self {
+        Self {
+            size,
+            hand: 0,
+            ref_bits: vec![false; size],
+            evictable: vec![false; size],
+        }
     }
 
-    pub fn unpin(self, frame_id: u64) {
-        todo!()
+    pub fn victim(&mut self) -> Result<u64> {
+        let mut searched = 0;
+        while searched < 2 * self.size {
+            if self.evictable[self.hand] {
+                if self.ref_bits[self.hand] {
+                    self.ref_bits[self.hand] = false;
+                } else {
+                    let victim_id = self.hand as u64;
+                    self.hand = (self.hand + 1) % self.size;
+                    return Ok(victim_id);
+                }
+            }
+            self.hand = (self.hand + 1) % self.size;
+            searched += 1;
+        }
+        Err(BufferPoolError::NotEvictable(0)) 
     }
 
-    pub fn pin(self, frame_id: u64) {
-        todo!()
+    pub fn unpin(&mut self, frame_id: u64) {
+        let idx = frame_id as usize;
+        self.evictable[idx] = true;
+        self.ref_bits[idx] = true;
+    }
+
+    pub fn pin(&mut self, frame_id: u64) {
+        let idx = frame_id as usize;
+        self.evictable[idx] = false;
+        self.ref_bits[idx] = false;
     }
 }
-// TODO: NEED TO IMPLEMENT A BACKGROUND TASK TO FLUSH THE EVICTED PAGES TO IMRPOVE THE PERFORMANCE
 
 #[derive(Clone, Copy)]
-struct Page {
+pub struct Page {
     pub id: u64, 
     pub pin_count: u64,
     pub is_dirty: bool,
-    pub data: [u64; MAX_PAGE_SIZE],
+    pub data: [u8; MAX_PAGE_SIZE],
+}
+
+impl Page {
+    fn new() -> Self {
+        Self {
+            id: 0,
+            pin_count: 0,
+            is_dirty: false,
+            data: [0u8; MAX_PAGE_SIZE],
+        }
+    }
 }
 
 pub struct BufferPoolManager {
-    pub disk_manager: DiskManager,
-    pub pages: [Page; MAX_POOL_SIZE],
-    pub periodic_flusher: PeriodicFlusher,
-    pub free_list: Vec<u64>,
-    pub page_table: HashMap<u64, u64>,
+    disk_manager: DiskManager,
+    pages: [Page; MAX_FRAMES],
+    replacer: ClockReplacer,
+    free_list: Vec<u64>,
+    page_table: HashMap<u64, u64>,
+    next_page_id: u64,
 }
 
 impl BufferPoolManager {
-    pub fn new(disk_manager: DiskManager, periodic_flusher: PeriodicFlusher) -> Self {
+    pub fn new(disk_manager: DiskManager) -> Self {
+        let mut free_list = Vec::with_capacity(MAX_FRAMES);
+        for i in (0..MAX_FRAMES).rev() {
+            free_list.push(i as u64);
+        }
+
         Self {
             disk_manager,
-            pages: [Page; MAX_POOL_SIZE],
-            periodic_flusher,
-            free_list: Vec::new(),
-            page_table: HashMap::new(),
+            pages: [Page::new(); MAX_FRAMES],
+            replacer: ClockReplacer::new(MAX_FRAMES),
+            free_list,
+            page_table: HashMap::with_capacity(MAX_FRAMES),
+            next_page_id: 0,
         }
     }
 
-    pub fn new_page() -> Page {
-    todo!()
+    fn find_frame(&mut self) -> Result<u64> {
+        if let Some(idx) = self.free_list.pop() {
+            Ok(idx)
+        } else {
+            let victim_idx = self.replacer.victim()?;
+            let victim_page = &mut self.pages[victim_idx as usize];
+            
+            if victim_page.is_dirty {
+                self.disk_manager.write_page(victim_page.id, &victim_page.data)
+                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+                self.disk_manager.sync_data()
+                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+            }
+            
+            self.page_table.remove(&victim_page.id);
+            Ok(victim_idx)
+        }
+    }
+
+    pub fn new_page(&mut self) -> Result<Page> {
+        let frame_id = self.find_frame()?;
+        let page_id = self.next_page_id;
+        self.next_page_id += 1;
+
+        let mut page = Page::new();
+        page.id = page_id;
+        page.pin_count = 1;
+
+        self.pages[frame_id as usize] = page;
+        self.page_table.insert(page_id, frame_id);
+        self.replacer.pin(frame_id);
+
+        Ok(page)
     }
 
     pub fn fetch_page(&mut self, page_id: u64) -> Result<Page> {
-        if let Some(frame_id) = self.page_table.get(&page_id) {
-            let mut page = self.pages[*frame_id as usize];
+        if let Some(&frame_id) = self.page_table.get(&page_id) {
+            let page = &mut self.pages[frame_id as usize];
             page.pin_count += 1;
-            self.periodic_flusher.pin(*frame_id);
-        } else {
-            let (mut frame_id, is_frame_available) = get_frame_id(*self);
-            if !is_frame_available {
-                frame_id = self.periodic_flusher.victim();
-            }
-            let page = self.disk_manager.read_page();
-            self.pages[frame_id as usize] = page;
-            self.page_table.insert(page_id, frame_id);
+            self.replacer.pin(frame_id);
+            return Ok(*page);
         }
-        return Ok(page);
+
+        let frame_id = self.find_frame()?;
+        let mut page = Page::new();
+        page.id = page_id;
+        page.pin_count = 1;
+
+        self.disk_manager.read_page(page_id, &mut page.data)
+            .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+
+        self.pages[frame_id as usize] = page;
+        self.page_table.insert(page_id, frame_id);
+        self.replacer.pin(frame_id);
+
+        Ok(page)
     }
 
-    pub fn flush_page(page_id: u64) -> Result<bool> {
-        todo!()
+    pub fn flush_page(&mut self, page_id: u64) -> Result<bool> {
+        if let Some(&frame_id) = self.page_table.get(&page_id) {
+            let page = &mut self.pages[frame_id as usize];
+            self.disk_manager.write_page(page.id, &page.data)
+                .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+            self.disk_manager.sync_data()
+                .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+            page.is_dirty = false;
+            Ok(true)
+        } else {
+            Err(BufferPoolError::PageNotFound(page_id))
+        }
     }
 
-    pub fn flush_all_pages() {
-        todo!()
+    pub fn flush_all_pages(&mut self) -> Result<()> {
+        let page_ids: Vec<u64> = self.page_table.keys().cloned().collect();
+        for pid in page_ids {
+            self.flush_page(pid)?;
+        }
+        Ok(())
     }
 
-    pub fn delete_page(page_id: u64) -> Result<()> {
-        todo!()
+    pub fn delete_page(&mut self, page_id: u64) -> Result<()> {
+        if let Some(&frame_id) = self.page_table.get(&page_id) {
+            let page = &self.pages[frame_id as usize];
+            if page.pin_count > 0 {
+                return Err(BufferPoolError::PinCountError);
+            }
+            self.page_table.remove(&page_id);
+            self.free_list.push(frame_id);
+            Ok(())
+        } else {
+            Err(BufferPoolError::PageNotFound(page_id))
+        }
     }
 
     pub fn unpin_page(&mut self, page_id: u64, is_dirty: bool) -> Result<()> {
-        if let Some(frame_id) = self.page_table.get(&page_id) {
-            let mut page = self.pages[*frame_id as usize];
-            let mut pin_count = page.pin_count;
-            if pin_count == 0 {
+        if let Some(&frame_id) = self.page_table.get(&page_id) {
+            let page = &mut self.pages[frame_id as usize];
+            if page.pin_count == 0 {
                 return Err(BufferPoolError::PinCountError);
-            } else {
-                pin_count -= 1;
             }
-            page.is_dirty = is_dirty;
-            if pin_count == 0 {
-                self.periodic_flusher.unpin(*frame_id);
+            page.pin_count -= 1;
+            page.is_dirty |= is_dirty;
+            if page.pin_count == 0 {
+                self.replacer.unpin(frame_id);
             }
             Ok(())
         } else {
-            return Err(BufferPoolError::PageNotFound(page_id));
+            Err(BufferPoolError::PageNotFound(page_id))
         }
     }
-
 }
-
-pub fn get_frame_id(manager: BufferPoolManager) -> (u64, bool) {
-    let list = manager.free_list;
-    if list.len() > 0 {
-        let frame_id = list[0];
-        let new_list = Vec::from(list[1:]);
-        return (frame_id, true);
-    }
-    return (manager.periodic_flusher.victim(), false);
-}
- 

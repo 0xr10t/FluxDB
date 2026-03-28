@@ -1,9 +1,9 @@
-use crate::{disk::DiskManager};
+use crate::disk::DiskManager;
 use common::{MAX_FRAMES, MAX_PAGE_SIZE};
-use std::{collections::HashMap};
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum BufferPoolError {
     PageNotFound(u64),
     PinCountError,
@@ -16,7 +16,7 @@ impl Display for BufferPoolError {
         match self {
             BufferPoolError::PageNotFound(page_id) => write!(f, "Page with page id: {} not found", page_id),
             BufferPoolError::PinCountError => write!(f, "Pin count cannot be negative"),
-            BufferPoolError::NotEvictable(frame_id) => write!(f, "Frame id: {} is not evictable from the free list", frame_id),
+            BufferPoolError::NotEvictable(frame_id) => write!(f, "Frame id: {} is not evictable", frame_id),
             BufferPoolError::InternalError(msg) => write!(f, "Internal error: {}", msg),
         }
     }
@@ -75,7 +75,7 @@ impl ClockReplacer {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Page {
     pub id: u64, 
     pub pin_count: u64,
@@ -229,5 +229,30 @@ impl BufferPoolManager {
         } else {
             Err(BufferPoolError::PageNotFound(page_id))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clock_replacer() {
+        let mut replacer = ClockReplacer::new(3);
+        
+        replacer.unpin(0);
+        replacer.unpin(1);
+        replacer.unpin(2);
+        
+        // Hand starts at 0.
+        // First victim: 0 (ref bit set to 1 by unpin, so it gets second chance)
+        // Rotation 1: 0(1->0), 1(1->0), 2(1->0)
+        // Rotation 2: 0(0->victim)
+        assert_eq!(replacer.victim().unwrap(), 0);
+        assert_eq!(replacer.victim().unwrap(), 1);
+        
+        // Pin 2 so it can't be victim
+        replacer.pin(2);
+        assert_eq!(replacer.victim().unwrap(), 0);
     }
 }

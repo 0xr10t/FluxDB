@@ -1,8 +1,9 @@
 use crate::disk::DiskManager;
-use common::{MAX_FRAMES, MAX_PAGE_SIZE};
+use common::{INVALID_FRAME_ID, MAX_FRAMES, MAX_PAGE_SIZE};
 use core::array::from_fn;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Debug, PartialEq)]
 pub enum BufferPoolError {
@@ -91,7 +92,7 @@ pub struct Page {
 impl Page {
     fn new() -> Self {
         Self {
-            id: 0,
+            id: INVALID_FRAME_ID,
             pin_count: 0,
             is_dirty: false,
             data: [0u8; MAX_PAGE_SIZE],
@@ -100,11 +101,15 @@ impl Page {
 }
 
 pub struct BufferPoolManager {
-    disk_manager: DiskManager,
-    pages: [Page; MAX_FRAMES],
-    replacer: ClockReplacer,
-    free_list: Vec<u64>,
+    disk_manager: Arc<DiskManager>,
+    pages: [RwLock<Page>; MAX_FRAMES],
+    inner: Mutex<Inner>,
+}
+
+struct Inner {
     page_table: HashMap<u64, u64>,
+    free_list: Vec<u64>,
+    replacer: ClockReplacer,
     next_page_id: u64,
 }
 
@@ -116,88 +121,118 @@ impl BufferPoolManager {
         }
 
         Self {
-            disk_manager,
-            pages: from_fn(|_| Page::new()),
-            replacer: ClockReplacer::new(MAX_FRAMES),
-            free_list,
-            page_table: HashMap::with_capacity(MAX_FRAMES),
-            next_page_id: 0,
+            disk_manager: Arc::new(disk_manager),
+            pages: from_fn(|_| RwLock::new(Page::new())),
+            inner: Mutex::new(Inner {
+                replacer: ClockReplacer::new(MAX_FRAMES),
+                free_list,
+                page_table: HashMap::with_capacity(MAX_FRAMES),
+                next_page_id: 0,
+            }),
         }
     }
 
-    pub fn page(&self, frame_id: u64) -> &Page {
-        &self.pages[frame_id as usize]
-    }
-
-    pub fn page_mut(&mut self, frame_id: u64) -> &mut Page {
-        &mut self.pages[frame_id as usize]
-    }
-
-    fn find_frame(&mut self) -> Result<u64> {
-        if let Some(idx) = self.free_list.pop() {
+    fn find_frame(&self) -> Result<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        
+        if let Some(idx) = inner.free_list.pop() {
+            inner.replacer.pin(idx);
             Ok(idx)
         } else {
-            let victim_idx = self.replacer.victim()?;
-            let victim_page = &mut self.pages[victim_idx as usize];
-
-            if victim_page.is_dirty {
-                self.disk_manager
-                    .write_page(victim_page.id, &victim_page.data)
-                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
-                self.disk_manager
-                    .sync_data()
-                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
-            }
-
-            self.page_table.remove(&victim_page.id);
+            let victim_idx = inner.replacer.victim()?;
+            let victim_id = self.pages[victim_idx as usize].read().unwrap().id;
+            
+            inner.page_table.remove(&victim_id);
+            inner.replacer.pin(victim_idx);
             Ok(victim_idx)
         }
     }
 
-    pub fn new_page(&mut self) -> Result<u64> {
+    pub fn new_page(&self) -> Result<u64> {
         let frame_id = self.find_frame()?;
-        let page_id = self.next_page_id;
-        self.next_page_id += 1;
+        
+        {
+            let mut page = self.pages[frame_id as usize].write().unwrap();
+            if page.is_dirty {
+                self.disk_manager
+                    .write_page(page.id, &page.data)
+                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+                self.disk_manager
+                    .sync_data()
+                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+                page.is_dirty = false;
+            }
 
-        let page = &mut self.pages[frame_id as usize];
-        page.id = page_id;
-        page.pin_count = 1;
-        page.is_dirty = false;
-        page.data.fill(0);
+            let page_id = {
+                let mut inner = self.inner.lock().unwrap();
+                let pid = inner.next_page_id;
+                inner.next_page_id += 1;
+                inner.page_table.insert(pid, frame_id);
+                pid
+            };
 
-        self.page_table.insert(page_id, frame_id);
-        self.replacer.pin(frame_id);
+            page.id = page_id;
+            page.pin_count = 1;
+            page.is_dirty = false;
+            page.data.fill(0);
+        }
 
         Ok(frame_id)
     }
 
-    pub fn fetch_page(&mut self, page_id: u64) -> Result<u64> {
-        if let Some(&frame_id) = self.page_table.get(&page_id) {
-            let page = &mut self.pages[frame_id as usize];
-            page.pin_count += 1;
-            self.replacer.pin(frame_id);
-            return Ok(frame_id);
+    pub fn fetch_page(&self, page_id: u64) -> Result<u64> {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(&frame_id) = inner.page_table.get(&page_id) {
+                let mut page = self.pages[frame_id as usize].write().unwrap();
+                page.pin_count += 1;
+                inner.replacer.pin(frame_id);
+                return Ok(frame_id);
+            }
         }
 
         let frame_id = self.find_frame()?;
-        let page = &mut self.pages[frame_id as usize];
-        page.id = page_id;
-        page.pin_count = 1;
-        page.is_dirty = false;
+        
+        {
+            let mut page = self.pages[frame_id as usize].write().unwrap();
+            
+            if page.is_dirty {
+                self.disk_manager
+                    .write_page(page.id, &page.data)
+                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+                self.disk_manager
+                    .sync_data()
+                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+                page.is_dirty = false;
+            }
 
-        self.disk_manager
-            .read_page(page_id, &mut page.data)
-            .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+            self.disk_manager
+                .read_page(page_id, &mut page.data)
+                .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
 
-        self.page_table.insert(page_id, frame_id);
-        self.replacer.pin(frame_id);
+            page.id = page_id;
+            page.pin_count = 1;
+            page.is_dirty = false;
+
+            let mut inner = self.inner.lock().unwrap();
+            inner.page_table.insert(page_id, frame_id);
+        }
 
         Ok(frame_id)
     }
 
-    pub fn flush_page(&mut self, page_id: u64) -> Result<bool> {
-        if let Some(&frame_id) = self.page_table.get(&page_id) {
-            let page = &mut self.pages[frame_id as usize];
+    pub fn flush_page(&self, page_id: u64) -> Result<bool> {
+        let frame_id = {
+            let inner = self.inner.lock().unwrap();
+            inner.page_table.get(&page_id).copied()
+        };
+
+        if let Some(frame_id) = frame_id {
+            let mut page = self.pages[frame_id as usize].write().unwrap();
+            if page.id != page_id {
+                return Ok(false);
+            }
+            
             self.disk_manager
                 .write_page(page.id, &page.data)
                 .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
@@ -211,24 +246,25 @@ impl BufferPoolManager {
         }
     }
 
-    pub fn flush_all_pages(&mut self) -> Result<()> {
-        let page_ids: Vec<u64> = self.page_table.keys().cloned().collect();
+    pub fn flush_all_pages(&self) -> Result<()> {
+        let page_ids: Vec<u64> = self.inner.lock().unwrap().page_table.keys().cloned().collect();
         for pid in page_ids {
             self.flush_page(pid)?;
         }
         Ok(())
     }
 
-    pub fn unpin_page(&mut self, page_id: u64, is_dirty: bool) -> Result<()> {
-        if let Some(&frame_id) = self.page_table.get(&page_id) {
-            let page = &mut self.pages[frame_id as usize];
+    pub fn unpin_page(&self, page_id: u64, is_dirty: bool) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(&frame_id) = inner.page_table.get(&page_id) {
+            let mut page = self.pages[frame_id as usize].write().unwrap();
             if page.pin_count == 0 {
                 return Err(BufferPoolError::PinCountError);
             }
             page.pin_count -= 1;
             page.is_dirty |= is_dirty;
             if page.pin_count == 0 {
-                self.replacer.unpin(frame_id);
+                inner.replacer.unpin(frame_id);
             }
             Ok(())
         } else {

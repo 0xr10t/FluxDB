@@ -318,7 +318,11 @@ impl BufferPoolShard {
         let res = self.write_frame_to_disk(frame_id, pid);
 
         let mut inner = self.inner.lock().unwrap();
-        inner.metadata[frame_id].pin_count -= 1;
+        let meta = &mut inner.metadata[frame_id];
+        meta.pin_count -= 1;
+        if meta.pin_count == 0 {
+            inner.replacer.unpin(frame_id);
+        }
         if let Err(e) = res {
             inner.metadata[frame_id].is_dirty = true;
             return Err(e);
@@ -378,7 +382,11 @@ impl BufferPoolShard {
                 let res = self.write_frame_to_disk(frame_id, pid);
 
                 let mut inner = self.inner.lock().unwrap();
-                inner.metadata[frame_id].pin_count -= 1;
+                let meta = &mut inner.metadata[frame_id];
+                meta.pin_count -= 1;
+                if meta.pin_count == 0 {
+                    inner.replacer.unpin(frame_id);
+                }
                 if let Err(_) = res {
                     inner.metadata[frame_id].is_dirty = true;
                     return Err(BufferPoolError::InternalError(
@@ -541,29 +549,139 @@ impl BufferPoolManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_clock_replacer_eviction_order() {
         let mut replacer = ClockReplacer::new(4);
-
         replacer.unpin(0);
         replacer.unpin(1);
         replacer.unpin(2);
         replacer.unpin(3);
-
         let v1 = replacer.victim().unwrap();
-        assert_eq!(v1, 0, "First eviction should be frame 0");
-
+        assert_eq!(v1, 0);
         let v2 = replacer.victim().unwrap();
-        assert_eq!(v2, 1, "Second eviction should be frame 1");
-
+        assert_eq!(v2, 1);
         replacer.pin(2);
         let v3 = replacer.victim().unwrap();
-        assert_eq!(v3, 3, "Should skip pinned frame 2 and evict frame 3");
+        assert_eq!(v3, 3);
         let result = replacer.victim();
-        assert!(
-            result.is_err(),
-            "Should return NoEvictableFrames when only pinned frames remain"
-        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_buffer_pool_manager_basic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+        let bpm = BufferPoolManager::new(disk_manager);
+        let page_id;
+        {
+            let mut page = bpm.new_page().unwrap();
+            page_id = page.page_id;
+            page[0] = 1;
+            page[1] = 2;
+        }
+        {
+            let page = bpm.fetch_page(page_id).unwrap();
+            assert_eq!(page[0], 1);
+            assert_eq!(page[1], 2);
+        }
+        {
+            let mut page = bpm.fetch_page_mut(page_id).unwrap();
+            page[0] = 3;
+        }
+        {
+            let page = bpm.fetch_page(page_id).unwrap();
+            assert_eq!(page[0], 3);
+        }
+    }
+
+    #[test]
+    fn test_buffer_pool_manager_eviction_persistence() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+        let bpm = BufferPoolManager::new(disk_manager);
+        let mut page_ids = Vec::new();
+        for i in 0..MAX_FRAMES + 1 {
+            let mut page = bpm.new_page().unwrap();
+            page[0] = i as u8;
+            page_ids.push(page.page_id);
+        }
+        for i in 0..MAX_FRAMES + 1 {
+            let page = bpm.fetch_page(page_ids[i]).unwrap();
+            assert_eq!(page[0], i as u8);
+        }
+    }
+
+    #[test]
+    fn test_buffer_pool_manager_full_lifecycle() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+        let bpm = BufferPoolManager::new(disk_manager);
+        let mut page_ids = Vec::new();
+        for i in 0..10 {
+            let mut page = bpm.new_page().unwrap();
+            let pid = page.page_id;
+            page[0] = i as u8;
+            page_ids.push(pid);
+        }
+        for i in 0..10 {
+            let page = bpm.fetch_page(page_ids[i]).unwrap();
+            assert_eq!(page[0], i as u8);
+        }
+        for i in 0..10 {
+            let mut page = bpm.fetch_page_mut(page_ids[i]).unwrap();
+            page[0] = (i + 10) as u8;
+        }
+        for i in 0..10 {
+            bpm.flush_page(page_ids[i]).unwrap();
+        }
+        for i in 0..10 {
+            let page = bpm.fetch_page(page_ids[i]).unwrap();
+            assert_eq!(page[0], (i + 10) as u8);
+        }
+    }
+
+    #[test]
+    fn test_buffer_pool_manager_concurrency() {
+        use std::thread;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+        let bpm = Arc::new(BufferPoolManager::new(disk_manager));
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let bpm_clone = bpm.clone();
+            handles.push(thread::spawn(move || {
+                let mut page = bpm_clone.new_page().unwrap();
+                page[0] = i as u8;
+                let pid = page.page_id;
+                drop(page);
+                let fetched = bpm_clone.fetch_page(pid).unwrap();
+                assert_eq!(fetched[0], i as u8);
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_buffer_pool_manager_pin_count() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+        let bpm = BufferPoolManager::new(disk_manager);
+        let mut pages = Vec::new();
+        for _ in 0..MAX_FRAMES {
+            pages.push(bpm.new_page().unwrap());
+        }
+        let res = bpm.new_page();
+        assert!(matches!(res, Err(BufferPoolError::NoEvictableFrames)));
+        drop(pages);
+        assert!(bpm.new_page().is_ok());
     }
 }

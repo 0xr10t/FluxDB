@@ -45,6 +45,10 @@ impl std::error::Error for BufferPoolError {}
 
 pub type Result<T> = std::result::Result<T, BufferPoolError>;
 
+/// An implementation of the Clock replacement algorithm.
+///
+/// The `ClockReplacer` tracks which pages are currently in the buffer pool
+/// and determines which page should be evicted when a new page needs to be loaded.
 #[derive(Debug)]
 struct ClockReplacer {
     size: usize,
@@ -54,6 +58,7 @@ struct ClockReplacer {
 }
 
 impl ClockReplacer {
+    /// Creates a new `ClockReplacer` with the specified capacity.
     fn new(size: usize) -> Self {
         Self {
             size,
@@ -63,6 +68,11 @@ impl ClockReplacer {
         }
     }
 
+    /// Finds a victim frame for eviction using the Clock algorithm.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferPoolError::NoEvictableFrames`] if all frames are currently pinned.
     fn victim(&mut self) -> Result<usize> {
         let mut searched = 0;
         let size = self.size;
@@ -84,21 +94,26 @@ impl ClockReplacer {
         Err(BufferPoolError::NoEvictableFrames)
     }
 
+    /// Notifies the replacer that a frame has been unpinned and is now a candidate for eviction.
     fn unpin(&mut self, local_id: usize) {
         self.evictable[local_id] = true;
         self.ref_bits[local_id] = true;
     }
 
+    /// Notifies the replacer that a frame has been pinned and cannot be evicted.
     fn pin(&mut self, local_id: usize) {
         self.evictable[local_id] = false;
         self.ref_bits[local_id] = false;
     }
 }
 
-// Used heap allocation for page data to avoid stack overflow
+/// A fixed-size buffer for a single database page.
+///
+/// This uses a heap-allocated `Box` to avoid stack overflow for large page sizes.
 pub struct PageData(Box<[u8; MAX_PAGE_SIZE]>);
 
 impl PageData {
+    /// Creates a new, zeroed `PageData`.
     fn new() -> Self {
         Self(
             vec![0u8; MAX_PAGE_SIZE]
@@ -122,6 +137,9 @@ impl DerefMut for PageData {
     }
 }
 
+/// An RAII guard for reading a page from the buffer pool.
+///
+/// When the guard is dropped, the page is automatically unpinned in the buffer pool.
 pub struct PageReadGuard<'a> {
     shard: &'a BufferPoolShard,
     page_id: u64,
@@ -147,6 +165,10 @@ impl<'a> Drop for PageReadGuard<'a> {
     }
 }
 
+/// An RAII guard for writing to a page in the buffer pool.
+///
+/// When the guard is dropped, the page is automatically unpinned and marked
+/// as dirty if any modifications were made.
 pub struct PageWriteGuard<'a> {
     shard: &'a BufferPoolShard,
     page_id: u64,
@@ -183,12 +205,20 @@ impl<'a> Drop for PageWriteGuard<'a> {
     }
 }
 
+/// Metadata for a single frame in a buffer pool shard.
 struct FrameMetadata {
+    /// The ID of the page currently residing in this frame.
     page_id: u64,
+    /// Number of active pins for this frame.
     pin_count: u64,
+    /// Whether the page in this frame has been modified.
     is_dirty: bool,
 }
 
+/// A shard of the buffer pool, managing a subset of the total frames.
+///
+/// Sharding reduces lock contention by allowing concurrent access to different
+/// parts of the buffer pool.
 struct BufferPoolShard {
     disk_manager: Arc<DiskManager>,
     pages: Vec<RwLock<PageData>>,
@@ -203,6 +233,7 @@ struct ShardInner {
 }
 
 impl BufferPoolShard {
+    /// Creates a new `BufferPoolShard` with the specified number of frames.
     fn new(disk_manager: Arc<DiskManager>, size: usize) -> Self {
         let mut metadata = Vec::with_capacity(size);
         let mut free_list = Vec::with_capacity(size);
@@ -227,6 +258,9 @@ impl BufferPoolShard {
         }
     }
 
+    /// Decrements the pin count of a page.
+    ///
+    /// If the pin count reaches zero, the frame becomes a candidate for eviction.
     fn unpin_page(&self, page_id: u64, is_dirty: bool) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(&local_id) = inner.page_table.get(&page_id) {
@@ -241,6 +275,9 @@ impl BufferPoolShard {
         }
     }
 
+    /// Increments the pin count of a page if it is already in the shard.
+    ///
+    /// Returns the frame ID if the page was found and pinned.
     fn pin_page(&self, page_id: u64) -> Option<usize> {
         let mut inner = self.inner.lock().unwrap();
         if let Some(&frame_id) = inner.page_table.get(&page_id) {
@@ -252,6 +289,7 @@ impl BufferPoolShard {
         }
     }
 
+    /// Finds a frame to be used for a new page, either from the free list or by eviction.
     fn find_victim_frame_id(&self, inner: &mut ShardInner) -> Result<usize> {
         if let Some(id) = inner.free_list.pop() {
             Ok(id)
@@ -260,6 +298,13 @@ impl BufferPoolShard {
         }
     }
 
+    /// Evicts a page if necessary and replaces it with the requested page.
+    ///
+    /// Returns the frame ID and a boolean indicating if the page needs to be loaded from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferPoolError::NoEvictableFrames`] if no frames can be evicted.
     fn evict_and_replace(&self, page_id: u64) -> Result<(usize, bool)> {
         loop {
             let mut inner = self.inner.lock().unwrap();
@@ -298,6 +343,11 @@ impl BufferPoolShard {
         }
     }
 
+    /// Flushes a specific page to disk if it is dirty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferPoolError::InternalError`] if an I/O error occurs.
     fn flush_page(&self, page_id: u64) -> Result<()> {
         let (pid, frame_id) = {
             let mut inner = self.inner.lock().unwrap();
@@ -331,6 +381,11 @@ impl BufferPoolShard {
         Ok(())
     }
 
+    /// Flushes all dirty pages in this shard to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferPoolError::InternalError`] if an I/O error occurs.
     fn flush_all_pages(&self) -> Result<()> {
         let n_frames = self.pages.len();
         for frame_id in 0..n_frames {
@@ -346,6 +401,7 @@ impl BufferPoolShard {
         Ok(())
     }
 
+    /// Writes the contents of a frame to its corresponding location on disk.
     fn write_frame_to_disk(&self, frame_id: usize, page_id: u64) -> Result<()> {
         let mut buf = vec![0u8; MAX_PAGE_SIZE];
         {
@@ -362,6 +418,11 @@ impl BufferPoolShard {
         Ok(())
     }
 
+    /// Deletes a page from the shard, freeing its frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferPoolError::PinCountError`] if the page is currently pinned.
     fn delete_page(&self, page_id: u64) -> Result<()> {
         loop {
             let mut inner = self.inner.lock().unwrap();
@@ -411,12 +472,17 @@ impl BufferPoolShard {
     }
 }
 
+/// The main manager for the buffer pool, providing a partitioned cache for disk pages.
+///
+/// It coordinates multiple `BufferPoolShard` instances to minimize lock contention
+/// and provides a high-level interface for fetching and creating pages.
 pub struct BufferPoolManager {
     shards: Vec<BufferPoolShard>,
     next_page_id: Mutex<u64>,
 }
 
 impl BufferPoolManager {
+    /// Creates a new `BufferPoolManager` using the provided `DiskManager`.
     pub fn new(disk_manager: Arc<DiskManager>) -> Self {
         let existing_pages = disk_manager.num_pages().unwrap_or(0);
 
@@ -431,11 +497,17 @@ impl BufferPoolManager {
         }
     }
 
+    /// Returns the shard index for the given page ID.
     #[inline]
     fn get_shard(&self, page_id: u64) -> &BufferPoolShard {
         &self.shards[(page_id & SHARD_MASK) as usize]
     }
 
+    /// Checks if a page ID is valid (i.e., it has been allocated).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferPoolError::PageNotFound`] if the page ID is out of bounds.
     fn check_page_id(&self, page_id: u64) -> Result<()> {
         let next_id = *self.next_page_id.lock().unwrap();
         if page_id >= next_id {
@@ -445,6 +517,13 @@ impl BufferPoolManager {
         }
     }
 
+    /// Creates a new page in the buffer pool.
+    ///
+    /// The new page is automatically pinned and zero-initialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferPoolError::NoEvictableFrames`] if no frames are available for eviction.
     pub fn new_page(&self) -> Result<PageWriteGuard<'_>> {
         let page_id = {
             let mut id = self.next_page_id.lock().unwrap();
@@ -467,6 +546,15 @@ impl BufferPoolManager {
         })
     }
 
+    /// Fetches a page from the buffer pool for reading.
+    ///
+    /// If the page is not in the pool, it is loaded from disk. The page is
+    /// automatically pinned upon return.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferPoolError::PageNotFound`] if the page ID is invalid,
+    /// or [`BufferPoolError::NoEvictableFrames`] if no frames are available.
     pub fn fetch_page(&self, page_id: u64) -> Result<PageReadGuard<'_>> {
         self.check_page_id(page_id)?;
         let shard = self.get_shard(page_id);
@@ -498,6 +586,15 @@ impl BufferPoolManager {
         })
     }
 
+    /// Fetches a page from the buffer pool for writing.
+    ///
+    /// Similar to `fetch_page`, but returns a write guard that marks the
+    /// page as dirty when dropped if modified.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferPoolError::PageNotFound`] if the page ID is invalid,
+    /// or [`BufferPoolError::NoEvictableFrames`] if no frames are available.
     pub fn fetch_page_mut(&self, page_id: u64) -> Result<PageWriteGuard<'_>> {
         self.check_page_id(page_id)?;
         let shard = self.get_shard(page_id);
@@ -530,10 +627,20 @@ impl BufferPoolManager {
         })
     }
 
+    /// Flushes a specific page to disk if it is dirty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferPoolError::InternalError`] if an I/O error occurs.
     pub fn flush_page(&self, page_id: u64) -> Result<()> {
         self.get_shard(page_id).flush_page(page_id)
     }
 
+    /// Flushes all dirty pages in the buffer pool to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferPoolError::InternalError`] if an I/O error occurs in any shard.
     pub fn flush_all_pages(&self) -> Result<()> {
         for shard in &self.shards {
             shard.flush_all_pages()?;
@@ -541,6 +648,11 @@ impl BufferPoolManager {
         Ok(())
     }
 
+    /// Deletes a page from the buffer pool and disk management.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferPoolError::PinCountError`] if the page is currently pinned.
     pub fn delete_page(&self, page_id: u64) -> Result<()> {
         self.get_shard(page_id).delete_page(page_id)
     }

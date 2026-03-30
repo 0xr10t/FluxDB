@@ -22,6 +22,17 @@ pub enum DiskError {
     InvalidPageSize,
 }
 
+impl std::fmt::Display for DiskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiskError::Io(err) => write!(f, "IO error: {}", err),
+            DiskError::InvalidPageSize => write!(f, "Invalid page size"),
+        }
+    }
+}
+
+impl std::error::Error for DiskError {}
+
 impl From<io::Error> for DiskError {
     fn from(err: io::Error) -> Self {
         DiskError::Io(err)
@@ -56,6 +67,12 @@ impl DiskManager {
             file,
             page_size,
         })
+    }
+
+    /// Returns the number of pages currently in the database file.
+    pub fn num_pages(&self) -> Result<u64> {
+        let metadata = self.file.metadata()?;
+        Ok(metadata.len() / self.page_size as u64)
     }
 
     /// Reads a page from the database file into the provided buffer.

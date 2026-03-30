@@ -84,14 +84,14 @@ impl ClockReplacer {
         Err(BufferPoolError::NoEvictableFrames)
     }
 
-    fn unpin(&mut self, local_idx: usize) {
-        self.evictable[local_idx] = true;
-        self.ref_bits[local_idx] = true;
+    fn unpin(&mut self, local_id: usize) {
+        self.evictable[local_id] = true;
+        self.ref_bits[local_id] = true;
     }
 
-    fn pin(&mut self, local_idx: usize) {
-        self.evictable[local_idx] = false;
-        self.ref_bits[local_idx] = false;
+    fn pin(&mut self, local_id: usize) {
+        self.evictable[local_id] = false;
+        self.ref_bits[local_id] = false;
     }
 }
 
@@ -206,13 +206,13 @@ impl BufferPoolShard {
     fn new(disk_manager: Arc<DiskManager>, size: usize) -> Self {
         let mut metadata = Vec::with_capacity(size);
         let mut free_list = Vec::with_capacity(size);
-        for i in 0..size {
+        for frame_id in 0..size {
             metadata.push(FrameMetadata {
                 page_id: INVALID_FRAME_ID,
                 pin_count: 0,
                 is_dirty: false,
             });
-            free_list.push(size - 1 - i);
+            free_list.push(size - 1 - frame_id);
         }
 
         Self {
@@ -229,68 +229,56 @@ impl BufferPoolShard {
 
     fn unpin_page(&self, page_id: u64, is_dirty: bool) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(&local_idx) = inner.page_table.get(&page_id) {
-            let meta = &mut inner.metadata[local_idx];
+        if let Some(&local_id) = inner.page_table.get(&page_id) {
+            let meta = &mut inner.metadata[local_id];
             if meta.pin_count > 0 {
                 meta.pin_count -= 1;
                 meta.is_dirty |= is_dirty;
                 if meta.pin_count == 0 {
-                    inner.replacer.unpin(local_idx);
+                    inner.replacer.unpin(local_id);
                 }
             }
         }
     }
 
-    fn find_victim_idx(&self, inner: &mut ShardInner) -> Result<usize> {
-        if let Some(idx) = inner.free_list.pop() {
-            Ok(idx)
+    fn pin_page(&self, page_id: u64) -> Option<usize> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(&frame_id) = inner.page_table.get(&page_id) {
+            inner.metadata[frame_id].pin_count += 1;
+            inner.replacer.pin(frame_id);
+            Some(frame_id)
+        } else {
+            None
+        }
+    }
+
+    fn find_victim_frame_id(&self, inner: &mut ShardInner) -> Result<usize> {
+        if let Some(id) = inner.free_list.pop() {
+            Ok(id)
         } else {
             inner.replacer.victim()
         }
     }
 
-    fn evict_and_install(&self, page_id: u64) -> Result<(usize, bool)> {
+    fn evict_and_replace(&self, page_id: u64) -> Result<(usize, bool)> {
         loop {
             let mut inner = self.inner.lock().unwrap();
 
             // Re-check page_table after acquiring lock to prevent double-loading
-            if let Some(&local_idx) = inner.page_table.get(&page_id) {
-                inner.metadata[local_idx].pin_count += 1;
-                inner.replacer.pin(local_idx);
-                return Ok((local_idx, false));
+            if let Some(&local_id) = inner.page_table.get(&page_id) {
+                inner.metadata[local_id].pin_count += 1;
+                inner.replacer.pin(local_id);
+                return Ok((local_id, false));
             }
 
-            let frame_id = self.find_victim_idx(&mut inner)?;
+            let frame_id = self.find_victim_frame_id(&mut inner)?;
             let meta = &inner.metadata[frame_id];
             let old_page_id = meta.page_id;
             let is_dirty = meta.is_dirty;
 
             if is_dirty && old_page_id != INVALID_FRAME_ID {
-                // Deadlock Prevention: Drop inner lock before acquiring page read lock
-                // Temporarily pin the frame so it's not evicted by someone else
-                inner.metadata[frame_id].pin_count += 1;
                 drop(inner);
-
-                let dirty_data = {
-                    let page_data = self.pages[frame_id].read().unwrap();
-                    let mut buf = vec![0u8; MAX_PAGE_SIZE];
-                    buf.copy_from_slice(&page_data[..]);
-                    buf
-                };
-
-                self.disk_manager
-                    .write_page(old_page_id, &dirty_data)
-                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
-                self.disk_manager
-                    .sync_data()
-                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
-
-                // Re-acquire lock and restore pin count
-                inner = self.inner.lock().unwrap();
-                inner.metadata[frame_id].pin_count -= 1;
-                inner.metadata[frame_id].is_dirty = false;
-
-                drop(inner);
+                self.flush_page(old_page_id)?;
                 continue;
             }
 
@@ -310,54 +298,105 @@ impl BufferPoolShard {
         }
     }
 
+    fn flush_page(&self, page_id: u64) -> Result<()> {
+        let (pid, frame_id) = {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(&id) = inner.page_table.get(&page_id) {
+                let meta = &mut inner.metadata[id];
+                if meta.is_dirty && meta.page_id != INVALID_FRAME_ID {
+                    meta.is_dirty = false;
+                    meta.pin_count += 1;
+                    (meta.page_id, id)
+                } else {
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
+            }
+        };
+
+        let res = self.write_frame_to_disk(frame_id, pid);
+
+        let mut inner = self.inner.lock().unwrap();
+        inner.metadata[frame_id].pin_count -= 1;
+        if let Err(e) = res {
+            inner.metadata[frame_id].is_dirty = true;
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    fn flush_all_pages(&self) -> Result<()> {
+        let n_frames = self.pages.len();
+        for frame_id in 0..n_frames {
+            let (pid, is_dirty) = {
+                let inner = self.inner.lock().unwrap();
+                let meta = &inner.metadata[frame_id];
+                (meta.page_id, meta.is_dirty)
+            };
+            if is_dirty && pid != INVALID_FRAME_ID {
+                self.flush_page(pid)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_frame_to_disk(&self, frame_id: usize, page_id: u64) -> Result<()> {
+        let mut buf = vec![0u8; MAX_PAGE_SIZE];
+        {
+            let data = self.pages[frame_id].read().unwrap();
+            buf.copy_from_slice(&data[..]);
+        }
+
+        self.disk_manager
+            .write_page(page_id, &buf)
+            .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+        self.disk_manager
+            .sync_data()
+            .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+        Ok(())
+    }
+
     fn delete_page(&self, page_id: u64) -> Result<()> {
         loop {
             let mut inner = self.inner.lock().unwrap();
-            let idx = match inner.page_table.get(&page_id) {
-                Some(&idx) => idx,
+            let frame_id = match inner.page_table.get(&page_id) {
+                Some(&id) => id,
                 None => return Ok(()),
             };
 
-            if inner.metadata[idx].pin_count > 0 {
+            if inner.metadata[frame_id].pin_count > 0 {
                 return Err(BufferPoolError::PinCountError);
             }
 
-            if inner.metadata[idx].is_dirty {
-                inner.metadata[idx].pin_count += 1;
-                let pid = inner.metadata[idx].page_id;
+            if inner.metadata[frame_id].is_dirty {
+                inner.metadata[frame_id].pin_count += 1;
+                let pid = inner.metadata[frame_id].page_id;
                 drop(inner);
 
-                let mut buf = vec![0u8; MAX_PAGE_SIZE];
-                {
-                    let data = self.pages[idx].read().unwrap();
-                    buf.copy_from_slice(&data[..]);
-                }
-
-                let res = self
-                    .disk_manager
-                    .write_page(pid, &buf)
-                    .and_then(|_| self.disk_manager.sync_data());
+                let res = self.write_frame_to_disk(frame_id, pid);
 
                 let mut inner = self.inner.lock().unwrap();
-                inner.metadata[idx].pin_count -= 1;
+                inner.metadata[frame_id].pin_count -= 1;
                 if let Err(_) = res {
-                    inner.metadata[idx].is_dirty = true;
+                    inner.metadata[frame_id].is_dirty = true;
                     return Err(BufferPoolError::InternalError(
                         "Flush failed during delete".to_string(),
                     ));
                 }
-                inner.metadata[idx].is_dirty = false;
+                inner.metadata[frame_id].is_dirty = false;
                 drop(inner);
                 continue;
             }
 
             inner.page_table.remove(&page_id);
-            let meta = &mut inner.metadata[idx];
+            let meta = &mut inner.metadata[frame_id];
             meta.page_id = INVALID_FRAME_ID;
             meta.pin_count = 0;
             meta.is_dirty = false;
-            inner.replacer.pin(idx);
-            inner.free_list.push(idx);
+            inner.replacer.pin(frame_id);
+            inner.free_list.push(frame_id);
 
             return Ok(());
         }
@@ -384,6 +423,20 @@ impl BufferPoolManager {
         }
     }
 
+    #[inline]
+    fn get_shard(&self, page_id: u64) -> &BufferPoolShard {
+        &self.shards[(page_id & SHARD_MASK) as usize]
+    }
+
+    fn check_page_id(&self, page_id: u64) -> Result<()> {
+        let next_id = *self.next_page_id.lock().unwrap();
+        if page_id >= next_id {
+            Err(BufferPoolError::PageNotFound(page_id))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn new_page(&self) -> Result<PageWriteGuard<'_>> {
         let page_id = {
             let mut id = self.next_page_id.lock().unwrap();
@@ -392,8 +445,8 @@ impl BufferPoolManager {
             pid
         };
 
-        let shard = &self.shards[(page_id & SHARD_MASK) as usize];
-        let (frame_id, _) = shard.evict_and_install(page_id)?;
+        let shard = self.get_shard(page_id);
+        let (frame_id, _) = shard.evict_and_replace(page_id)?;
 
         let mut data = shard.pages[frame_id].write().unwrap();
         data.fill(0);
@@ -407,32 +460,19 @@ impl BufferPoolManager {
     }
 
     pub fn fetch_page(&self, page_id: u64) -> Result<PageReadGuard<'_>> {
-        {
-            let next_id = *self.next_page_id.lock().unwrap();
-            if page_id >= next_id {
-                return Err(BufferPoolError::PageNotFound(page_id));
-            }
+        self.check_page_id(page_id)?;
+        let shard = self.get_shard(page_id);
+
+        if let Some(frame_id) = shard.pin_page(page_id) {
+            let data = shard.pages[frame_id].read().unwrap();
+            return Ok(PageReadGuard {
+                shard,
+                page_id,
+                guard: Some(data),
+            });
         }
 
-        let shard = &self.shards[(page_id & SHARD_MASK) as usize];
-
-        {
-            let mut inner = shard.inner.lock().unwrap();
-            if let Some(&local_idx) = inner.page_table.get(&page_id) {
-                let meta = &mut inner.metadata[local_idx];
-                meta.pin_count += 1;
-                inner.replacer.pin(local_idx);
-                drop(inner);
-                let data = shard.pages[local_idx].read().unwrap();
-                return Ok(PageReadGuard {
-                    shard,
-                    page_id,
-                    guard: Some(data),
-                });
-            }
-        }
-
-        let (frame_id, needs_load) = shard.evict_and_install(page_id)?;
+        let (frame_id, needs_load) = shard.evict_and_replace(page_id)?;
 
         if needs_load {
             let mut data = shard.pages[frame_id].write().unwrap();
@@ -451,33 +491,20 @@ impl BufferPoolManager {
     }
 
     pub fn fetch_page_mut(&self, page_id: u64) -> Result<PageWriteGuard<'_>> {
-        {
-            let next_id = *self.next_page_id.lock().unwrap();
-            if page_id >= next_id {
-                return Err(BufferPoolError::PageNotFound(page_id));
-            }
+        self.check_page_id(page_id)?;
+        let shard = self.get_shard(page_id);
+
+        if let Some(frame_id) = shard.pin_page(page_id) {
+            let data = shard.pages[frame_id].write().unwrap();
+            return Ok(PageWriteGuard {
+                shard,
+                page_id,
+                guard: Some(data),
+                dirty: false,
+            });
         }
 
-        let shard = &self.shards[(page_id & SHARD_MASK) as usize];
-
-        {
-            let mut inner = shard.inner.lock().unwrap();
-            if let Some(&local_idx) = inner.page_table.get(&page_id) {
-                let meta = &mut inner.metadata[local_idx];
-                meta.pin_count += 1;
-                inner.replacer.pin(local_idx);
-                drop(inner);
-                let data = shard.pages[local_idx].write().unwrap();
-                return Ok(PageWriteGuard {
-                    shard,
-                    page_id,
-                    guard: Some(data),
-                    dirty: false,
-                });
-            }
-        }
-
-        let (frame_id, needs_load) = shard.evict_and_install(page_id)?;
+        let (frame_id, needs_load) = shard.evict_and_replace(page_id)?;
 
         let mut data = shard.pages[frame_id].write().unwrap();
         if needs_load {
@@ -496,100 +523,18 @@ impl BufferPoolManager {
     }
 
     pub fn flush_page(&self, page_id: u64) -> Result<()> {
-        let shard = &self.shards[(page_id & SHARD_MASK) as usize];
-
-        let (pid, idx) = {
-            let mut inner = shard.inner.lock().unwrap();
-            if let Some(&idx) = inner.page_table.get(&page_id) {
-                let meta = &mut inner.metadata[idx];
-                if meta.is_dirty && meta.page_id != INVALID_FRAME_ID {
-                    meta.is_dirty = false;
-                    meta.pin_count += 1;
-                    (meta.page_id, idx)
-                } else {
-                    return Ok(());
-                }
-            } else {
-                return Ok(());
-            }
-        };
-
-        let mut buf = vec![0u8; MAX_PAGE_SIZE];
-        {
-            let data = shard.pages[idx].read().unwrap();
-            buf.copy_from_slice(&data[..]);
-        }
-
-        let res = shard
-            .disk_manager
-            .write_page(pid, &buf)
-            .and_then(|_| shard.disk_manager.sync_data());
-
-        let mut inner = shard.inner.lock().unwrap();
-        inner.metadata[idx].pin_count -= 1;
-        if let Err(e) = res {
-            inner.metadata[idx].is_dirty = true;
-            return Err(BufferPoolError::InternalError(e.to_string()));
-        }
-
-        Ok(())
+        self.get_shard(page_id).flush_page(page_id)
     }
 
     pub fn flush_all_pages(&self) -> Result<()> {
         for shard in &self.shards {
-            let mut flushed_indices = Vec::new();
-            let n_frames = shard.pages.len();
-
-            for i in 0..n_frames {
-                let (pid, idx) = {
-                    let mut inner = shard.inner.lock().unwrap();
-                    let meta = &mut inner.metadata[i];
-                    if meta.is_dirty && meta.page_id != INVALID_FRAME_ID {
-                        meta.is_dirty = false;
-                        meta.pin_count += 1;
-                        (meta.page_id, i)
-                    } else {
-                        continue;
-                    }
-                };
-
-                let mut buf = vec![0u8; MAX_PAGE_SIZE];
-                {
-                    let data = shard.pages[idx].read().unwrap();
-                    buf.copy_from_slice(&data[..]);
-                }
-
-                if let Err(_) = shard.disk_manager.write_page(pid, &buf) {
-                    let mut inner = shard.inner.lock().unwrap();
-                    inner.metadata[idx].pin_count -= 1;
-                    inner.metadata[idx].is_dirty = true;
-                    continue;
-                }
-
-                flushed_indices.push(idx);
-            }
-
-            if !flushed_indices.is_empty() {
-                if let Err(_) = shard.disk_manager.sync_data() {
-                    let mut inner = shard.inner.lock().unwrap();
-                    for idx in flushed_indices {
-                        inner.metadata[idx].pin_count -= 1;
-                        inner.metadata[idx].is_dirty = true;
-                    }
-                } else {
-                    let mut inner = shard.inner.lock().unwrap();
-                    for idx in flushed_indices {
-                        inner.metadata[idx].pin_count -= 1;
-                    }
-                }
-            }
+            shard.flush_all_pages()?;
         }
         Ok(())
     }
 
     pub fn delete_page(&self, page_id: u64) -> Result<()> {
-        let shard = &self.shards[(page_id & SHARD_MASK) as usize];
-        shard.delete_page(page_id)
+        self.get_shard(page_id).delete_page(page_id)
     }
 }
 

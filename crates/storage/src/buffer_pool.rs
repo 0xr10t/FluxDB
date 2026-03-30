@@ -125,18 +125,24 @@ impl DerefMut for PageData {
 pub struct PageReadGuard<'a> {
     shard: &'a BufferPoolShard,
     page_id: u64,
-    guard: RwLockReadGuard<'a, PageData>,
+    guard: Option<RwLockReadGuard<'a, PageData>>,
 }
 
 impl<'a> Deref for PageReadGuard<'a> {
     type Target = [u8; MAX_PAGE_SIZE];
     fn deref(&self) -> &Self::Target {
-        self.guard.deref()
+        self.guard
+            .as_ref()
+            .expect("Guard should be present")
+            .deref()
     }
 }
 
 impl<'a> Drop for PageReadGuard<'a> {
     fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            drop(guard);
+        }
         self.shard.unpin_page(self.page_id, false);
     }
 }
@@ -144,26 +150,35 @@ impl<'a> Drop for PageReadGuard<'a> {
 pub struct PageWriteGuard<'a> {
     shard: &'a BufferPoolShard,
     page_id: u64,
-    guard: RwLockWriteGuard<'a, PageData>,
+    guard: Option<RwLockWriteGuard<'a, PageData>>,
     dirty: bool,
 }
 
 impl<'a> Deref for PageWriteGuard<'a> {
     type Target = [u8; MAX_PAGE_SIZE];
     fn deref(&self) -> &Self::Target {
-        self.guard.deref()
+        self.guard
+            .as_ref()
+            .expect("Guard should be present")
+            .deref()
     }
 }
 
 impl<'a> DerefMut for PageWriteGuard<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.dirty = true;
-        self.guard.deref_mut()
+        self.guard
+            .as_mut()
+            .expect("Guard should be present")
+            .deref_mut()
     }
 }
 
 impl<'a> Drop for PageWriteGuard<'a> {
     fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            drop(guard);
+        }
         self.shard.unpin_page(self.page_id, self.dirty);
     }
 }
@@ -234,16 +249,15 @@ impl BufferPoolShard {
         }
     }
 
-    fn evict_and_install(&self, page_id: u64) -> Result<usize> {
-        let (frame_id, dirty_flush_data) = {
+    fn evict_and_install(&self, page_id: u64) -> Result<(usize, bool)> {
+        loop {
             let mut inner = self.inner.lock().unwrap();
 
             // Re-check page_table after acquiring lock to prevent double-loading
-            if inner.page_table.contains_key(&page_id) {
-                let local_idx = inner.page_table[&page_id];
+            if let Some(&local_idx) = inner.page_table.get(&page_id) {
                 inner.metadata[local_idx].pin_count += 1;
                 inner.replacer.pin(local_idx);
-                return Ok(local_idx);
+                return Ok((local_idx, false));
             }
 
             let frame_id = self.find_victim_idx(&mut inner)?;
@@ -251,18 +265,39 @@ impl BufferPoolShard {
             let old_page_id = meta.page_id;
             let is_dirty = meta.is_dirty;
 
-            let dirty_data = if is_dirty && old_page_id != INVALID_FRAME_ID {
-                let page_data = self.pages[frame_id].read().unwrap();
-                let mut buf = vec![0u8; MAX_PAGE_SIZE];
-                buf.copy_from_slice(&page_data[..]);
-                Some((old_page_id, buf))
-            } else {
-                None
-            };
+            if is_dirty && old_page_id != INVALID_FRAME_ID {
+                // Deadlock Prevention: Drop inner lock before acquiring page read lock
+                // Temporarily pin the frame so it's not evicted by someone else
+                inner.metadata[frame_id].pin_count += 1;
+                drop(inner);
+
+                let dirty_data = {
+                    let page_data = self.pages[frame_id].read().unwrap();
+                    let mut buf = vec![0u8; MAX_PAGE_SIZE];
+                    buf.copy_from_slice(&page_data[..]);
+                    buf
+                };
+
+                self.disk_manager
+                    .write_page(old_page_id, &dirty_data)
+                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+                self.disk_manager
+                    .sync_data()
+                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+
+                // Re-acquire lock and restore pin count
+                inner = self.inner.lock().unwrap();
+                inner.metadata[frame_id].pin_count -= 1;
+                inner.metadata[frame_id].is_dirty = false;
+
+                drop(inner);
+                continue;
+            }
 
             if old_page_id != INVALID_FRAME_ID {
                 inner.page_table.remove(&old_page_id);
             }
+
             let meta = &mut inner.metadata[frame_id];
             meta.page_id = page_id;
             meta.pin_count = 1;
@@ -271,19 +306,61 @@ impl BufferPoolShard {
             inner.page_table.insert(page_id, frame_id);
             inner.replacer.pin(frame_id);
 
-            (frame_id, dirty_data)
-        };
-
-        if let Some((old_page_id, data)) = dirty_flush_data {
-            self.disk_manager
-                .write_page(old_page_id, &data)
-                .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
-            self.disk_manager
-                .sync_data()
-                .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+            return Ok((frame_id, true));
         }
+    }
 
-        Ok(frame_id)
+    fn delete_page(&self, page_id: u64) -> Result<()> {
+        loop {
+            let mut inner = self.inner.lock().unwrap();
+            let idx = match inner.page_table.get(&page_id) {
+                Some(&idx) => idx,
+                None => return Ok(()),
+            };
+
+            if inner.metadata[idx].pin_count > 0 {
+                return Err(BufferPoolError::PinCountError);
+            }
+
+            if inner.metadata[idx].is_dirty {
+                inner.metadata[idx].pin_count += 1;
+                let pid = inner.metadata[idx].page_id;
+                drop(inner);
+
+                let mut buf = vec![0u8; MAX_PAGE_SIZE];
+                {
+                    let data = self.pages[idx].read().unwrap();
+                    buf.copy_from_slice(&data[..]);
+                }
+
+                let res = self
+                    .disk_manager
+                    .write_page(pid, &buf)
+                    .and_then(|_| self.disk_manager.sync_data());
+
+                let mut inner = self.inner.lock().unwrap();
+                inner.metadata[idx].pin_count -= 1;
+                if let Err(_) = res {
+                    inner.metadata[idx].is_dirty = true;
+                    return Err(BufferPoolError::InternalError(
+                        "Flush failed during delete".to_string(),
+                    ));
+                }
+                inner.metadata[idx].is_dirty = false;
+                drop(inner);
+                continue;
+            }
+
+            inner.page_table.remove(&page_id);
+            let meta = &mut inner.metadata[idx];
+            meta.page_id = INVALID_FRAME_ID;
+            meta.pin_count = 0;
+            meta.is_dirty = false;
+            inner.replacer.pin(idx);
+            inner.free_list.push(idx);
+
+            return Ok(());
+        }
     }
 }
 
@@ -316,7 +393,7 @@ impl BufferPoolManager {
         };
 
         let shard = &self.shards[(page_id & SHARD_MASK) as usize];
-        let frame_id = shard.evict_and_install(page_id)?;
+        let (frame_id, _) = shard.evict_and_install(page_id)?;
 
         let mut data = shard.pages[frame_id].write().unwrap();
         data.fill(0);
@@ -324,12 +401,19 @@ impl BufferPoolManager {
         Ok(PageWriteGuard {
             shard,
             page_id,
-            guard: data,
+            guard: Some(data),
             dirty: false,
         })
     }
 
     pub fn fetch_page(&self, page_id: u64) -> Result<PageReadGuard<'_>> {
+        {
+            let next_id = *self.next_page_id.lock().unwrap();
+            if page_id >= next_id {
+                return Err(BufferPoolError::PageNotFound(page_id));
+            }
+        }
+
         let shard = &self.shards[(page_id & SHARD_MASK) as usize];
 
         {
@@ -343,14 +427,14 @@ impl BufferPoolManager {
                 return Ok(PageReadGuard {
                     shard,
                     page_id,
-                    guard: data,
+                    guard: Some(data),
                 });
             }
         }
 
-        let frame_id = shard.evict_and_install(page_id)?;
+        let (frame_id, needs_load) = shard.evict_and_install(page_id)?;
 
-        {
+        if needs_load {
             let mut data = shard.pages[frame_id].write().unwrap();
             shard
                 .disk_manager
@@ -362,11 +446,18 @@ impl BufferPoolManager {
         Ok(PageReadGuard {
             shard,
             page_id,
-            guard: data,
+            guard: Some(data),
         })
     }
 
     pub fn fetch_page_mut(&self, page_id: u64) -> Result<PageWriteGuard<'_>> {
+        {
+            let next_id = *self.next_page_id.lock().unwrap();
+            if page_id >= next_id {
+                return Err(BufferPoolError::PageNotFound(page_id));
+            }
+        }
+
         let shard = &self.shards[(page_id & SHARD_MASK) as usize];
 
         {
@@ -380,24 +471,26 @@ impl BufferPoolManager {
                 return Ok(PageWriteGuard {
                     shard,
                     page_id,
-                    guard: data,
+                    guard: Some(data),
                     dirty: false,
                 });
             }
         }
 
-        let frame_id = shard.evict_and_install(page_id)?;
+        let (frame_id, needs_load) = shard.evict_and_install(page_id)?;
 
         let mut data = shard.pages[frame_id].write().unwrap();
-        shard
-            .disk_manager
-            .read_page(page_id, data.0.as_mut())
-            .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+        if needs_load {
+            shard
+                .disk_manager
+                .read_page(page_id, data.0.as_mut())
+                .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+        }
 
         Ok(PageWriteGuard {
             shard,
             page_id,
-            guard: data,
+            guard: Some(data),
             dirty: false,
         })
     }
@@ -405,34 +498,38 @@ impl BufferPoolManager {
     pub fn flush_page(&self, page_id: u64) -> Result<()> {
         let shard = &self.shards[(page_id & SHARD_MASK) as usize];
 
-        let flush_info = {
+        let (pid, idx) = {
             let mut inner = shard.inner.lock().unwrap();
             if let Some(&idx) = inner.page_table.get(&page_id) {
                 let meta = &mut inner.metadata[idx];
                 if meta.is_dirty && meta.page_id != INVALID_FRAME_ID {
-                    let pid = meta.page_id;
                     meta.is_dirty = false;
-                    let page_data = shard.pages[idx].read().unwrap();
-                    let mut buf = vec![0u8; MAX_PAGE_SIZE];
-                    buf.copy_from_slice(&page_data[..]);
-                    Some((pid, buf))
+                    meta.pin_count += 1;
+                    (meta.page_id, idx)
                 } else {
-                    None
+                    return Ok(());
                 }
             } else {
-                None
+                return Ok(());
             }
         };
 
-        if let Some((pid, data)) = flush_info {
-            shard
-                .disk_manager
-                .write_page(pid, &data)
-                .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
-            shard
-                .disk_manager
-                .sync_data()
-                .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+        let mut buf = vec![0u8; MAX_PAGE_SIZE];
+        {
+            let data = shard.pages[idx].read().unwrap();
+            buf.copy_from_slice(&data[..]);
+        }
+
+        let res = shard
+            .disk_manager
+            .write_page(pid, &buf)
+            .and_then(|_| shard.disk_manager.sync_data());
+
+        let mut inner = shard.inner.lock().unwrap();
+        inner.metadata[idx].pin_count -= 1;
+        if let Err(e) = res {
+            inner.metadata[idx].is_dirty = true;
+            return Err(BufferPoolError::InternalError(e.to_string()));
         }
 
         Ok(())
@@ -440,37 +537,59 @@ impl BufferPoolManager {
 
     pub fn flush_all_pages(&self) -> Result<()> {
         for shard in &self.shards {
-            let dirty_pages: Vec<(u64, Vec<u8>)> = {
-                let mut inner = shard.inner.lock().unwrap();
-                let mut dirty = Vec::new();
-                for i in 0..inner.metadata.len() {
+            let mut flushed_indices = Vec::new();
+            let n_frames = shard.pages.len();
+
+            for i in 0..n_frames {
+                let (pid, idx) = {
+                    let mut inner = shard.inner.lock().unwrap();
                     let meta = &mut inner.metadata[i];
                     if meta.is_dirty && meta.page_id != INVALID_FRAME_ID {
-                        let pid = meta.page_id;
                         meta.is_dirty = false;
-                        let page_data = shard.pages[i].read().unwrap();
-                        let mut buf = vec![0u8; MAX_PAGE_SIZE];
-                        buf.copy_from_slice(&page_data[..]);
-                        dirty.push((pid, buf));
+                        meta.pin_count += 1;
+                        (meta.page_id, i)
+                    } else {
+                        continue;
+                    }
+                };
+
+                let mut buf = vec![0u8; MAX_PAGE_SIZE];
+                {
+                    let data = shard.pages[idx].read().unwrap();
+                    buf.copy_from_slice(&data[..]);
+                }
+
+                if let Err(_) = shard.disk_manager.write_page(pid, &buf) {
+                    let mut inner = shard.inner.lock().unwrap();
+                    inner.metadata[idx].pin_count -= 1;
+                    inner.metadata[idx].is_dirty = true;
+                    continue;
+                }
+
+                flushed_indices.push(idx);
+            }
+
+            if !flushed_indices.is_empty() {
+                if let Err(_) = shard.disk_manager.sync_data() {
+                    let mut inner = shard.inner.lock().unwrap();
+                    for idx in flushed_indices {
+                        inner.metadata[idx].pin_count -= 1;
+                        inner.metadata[idx].is_dirty = true;
+                    }
+                } else {
+                    let mut inner = shard.inner.lock().unwrap();
+                    for idx in flushed_indices {
+                        inner.metadata[idx].pin_count -= 1;
                     }
                 }
-                dirty
-            };
-
-            for (pid, data) in &dirty_pages {
-                shard
-                    .disk_manager
-                    .write_page(*pid, data)
-                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
-            }
-            if !dirty_pages.is_empty() {
-                shard
-                    .disk_manager
-                    .sync_data()
-                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
             }
         }
         Ok(())
+    }
+
+    pub fn delete_page(&self, page_id: u64) -> Result<()> {
+        let shard = &self.shards[(page_id & SHARD_MASK) as usize];
+        shard.delete_page(page_id)
     }
 }
 

@@ -57,4 +57,9 @@ impl DiskManager {
     pub fn sync_file_and_dir(file: &File, _file_path: &Path) -> io::Result<()> {
         todo!()
     }
+
+    // Fetches the number of pages in the file stored on disk
+    pub fn num_pages(&self) -> io::Result<u64> {
+        todo!()
+    }
 }

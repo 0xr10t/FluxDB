@@ -1,6 +1,19 @@
-use std::fmt::Debug; 
+use std::fmt::Debug;
 use std::mem::size_of;
-use std::cmp::Ordering; 
+use std::cmp::Ordering;
+use thiserror::Error;
+
+/// Errors that can occur when deserializing a [`TypeName`] from raw bytes.
+#[derive(Debug, Error)]
+pub enum TypeNameError {
+    #[error("empty input: need at least 1 byte for the classification tag")]
+    Empty,
+    #[error("unknown classification byte: {0}")]
+    UnknownClassification(u8),
+    #[error("invalid UTF-8 in type name: {0}")]
+    InvalidUtf8(#[from] std::str::Utf8Error),
+}
+
 #[derive(Eq, PartialEq, Debug, Clone)]
 enum TypeClassification {
     Internal,
@@ -15,11 +28,11 @@ impl TypeClassification {
         }
     }
 
-    fn from_byte(value: u8) -> Self {
+    fn from_byte(value: u8) -> Result<Self, TypeNameError> {
         match value {
-            1 => TypeClassification::Internal,
-            2 => TypeClassification::UserDefined,
-            _ => unreachable!(),
+            1 => Ok(TypeClassification::Internal),
+            2 => Ok(TypeClassification::UserDefined),
+            v => Err(TypeNameError::UnknownClassification(v)),
         }
     }
 }
@@ -51,14 +64,13 @@ impl TypeName {
         result
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        let classification = TypeClassification::from_byte(bytes[0]); // first byte represents the type 
-        let name = std::str::from_utf8(&bytes[1..]).unwrap().to_string();
-
-        Self {
-            classification,
-            name,
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, TypeNameError> {
+        if bytes.is_empty() {
+            return Err(TypeNameError::Empty);
         }
+        let classification = TypeClassification::from_byte(bytes[0])?;
+        let name = std::str::from_utf8(&bytes[1..])?.to_string();
+        Ok(Self { classification, name })
     }
 
     pub fn name(&self) -> &str {

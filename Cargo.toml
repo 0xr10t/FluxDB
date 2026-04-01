@@ -5,3 +5,4 @@ members = ["crates/*"]
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
 common = { path = "crates/common" }
+thiserror = "1"

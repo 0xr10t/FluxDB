@@ -1,58 +1,1192 @@
-//! Functionality for managing B+Tree
-//! Sort according to a key, add nodes, traverse the tree
-//! to find result to a query, etc.
+//! B+Tree index — Lehman-Yao optimistic locking with MVCC.
 //!
-//! Responsibilities (this module):
-//! - Provide a stable API: get/insert/delete/range_scan.
-//! - Navigate from root -> leaf using internal pages.
-//! - Modify leaf/internal pages.
-//! - Interact with BufferPool for page I/O and with WAL via BufferPool (WAL-before-page flush).
+//! ## Concurrency model
+//! Optimistic descent with shared latches only. Exclusive latch on the leaf
+//! for mutation. Snapshot-based MVCC visibility determines which record
+//! versions a transaction can see. First-writer-wins conflict detection
+//! prevents lost updates.
 
-use std::sync::Arc;
+use std::cmp::Ordering;
+use std::marker::PhantomData;
+use std::ops::{Bound, RangeBounds};
+use std::sync::{Arc, Mutex};
 
-use crate::{buffer_pool::BufferPoolManager, page::PageId};
+use common::{Key, Value, MAX_KEY_SIZE};
+
+use crate::buffer_pool::{BufferPoolError, BufferPoolManager, PageReadGuard, PageWriteGuard};
+use crate::page::{
+    InternalPageAccessor, InternalPageBuilder, InternalPageMutator,
+    LeafPageAccessor, LeafPageBuilder, LeafPageMutator,
+    PageId, INTERNAL, LEAF,
+};
+
+use db_core::transaction::{Transaction, Snapshot, is_visible}; 
+// ── Error type ────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
-pub enum IndexError {}
+pub enum IndexError {
+    KeyNotFound,
+    KeyTooLarge { size: usize, max: usize },
+    /// Insert attempted on a key that already has a visible version.
+    DuplicateKey,
+    /// Another in-progress transaction has already modified this record.
+    /// First-writer-wins: the current transaction should abort.
+    WriteConflict,
+    UnexpectedPageType { expected: u8, found: u8 },
+    BufferPool(BufferPoolError),
+}
+
+impl From<BufferPoolError> for IndexError {
+    fn from(e: BufferPoolError) -> Self {
+        IndexError::BufferPool(e)
+    }
+}
 
 pub type Result<T> = std::result::Result<T, IndexError>;
 
-/// Comparator for keys.
-/// Since B Tree is sorted by comparison of keys
-/// a method is needed to compare keys
-pub trait KeyCmp: Send + Sync + 'static {
-    fn cmp(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering;
+// ── SplitResult ───────────────────────────────────────────────────────────────
+
+struct SplitResult {
+    separator_key: Vec<u8>,
+    new_page_id: PageId,
 }
 
-/// Persistent metadata for an index.
-#[derive(Debug, Clone, Copy)]
-pub struct BTreeMeta {
-    pub root: PageId,
+// ── BTStack ───────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+struct BTStackEntry {
+    page_id: PageId,
 }
 
-/// B+Tree index (keys -> inline row bytes).
-pub struct BTreeIndex {
+type BTStack = Vec<BTStackEntry>;
+
+// ── BTreeIndex ────────────────────────────────────────────────────────────────
+
+pub struct BTreeIndex<K: Key, V: Value> {
     pool: Arc<BufferPoolManager>,
-    meta: BTreeMeta,
+    root: Mutex<PageId>,
+    _key: PhantomData<K>,
+    _val: PhantomData<V>,
 }
 
-impl BTreeIndex {
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        todo!()
+impl<K: Key, V: Value> BTreeIndex<K, V> {
+
+    // ── Constructors ──────────────────────────────────────────────────────────
+
+    pub fn open(pool: Arc<BufferPoolManager>, root_id: PageId) -> Self {
+        Self { pool, root: Mutex::new(root_id), _key: PhantomData, _val: PhantomData }
     }
 
-    /// Insert (key -> row_bytes).
-    pub fn insert(&self, key: &[u8], row: &[u8]) -> Result<()> {
-        todo!()
+    pub fn create(pool: Arc<BufferPoolManager>) -> Result<(Self, PageId)> {
+        let mut guard = pool.new_page()?;
+        let page_id = guard.page_id;
+        LeafPageBuilder::<K, V>::new(page_id, &mut guard[..]);
+        drop(guard);
+        Ok((Self::open(pool, page_id), page_id))
     }
 
-    /// Delete a key.
-    pub fn delete(&self, key: &[u8]) -> Result<()> {
-        todo!()
+    pub fn root_page_id(&self) -> PageId {
+        *self.root.lock().unwrap()
     }
 
-    /// Traverse internal nodes to find the leaf that should contain `key`.
-    fn find_leaf(&self, mut pid: PageId, key: &[u8]) -> Result<PageId> {
-        todo!()
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    /// Look up `key` and return the value visible to `txn`, or `None`.
+    pub fn get(&self, key: &K::SelfType<'_>, txn: &Transaction) -> Result<Option<Vec<u8>>> {
+        let root_pid = *self.root.lock().unwrap();
+        let leaf_pid = self.find_leaf(root_pid, key)?;
+        let key_bytes = K::as_bytes(key);
+
+        // Shared latch on leaf + rightlink correction.
+        let mut page = self.pool.fetch_page(leaf_pid)?;
+        loop {
+            let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+            if let Some(hk) = acc.high_key_bytes() {
+                if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
+                    let right = acc.rightlink().unwrap();
+                    drop(page);
+                    page = self.pool.fetch_page(right)?;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+        match self.find_visible_slot(&acc, key, &txn.snapshot) {
+            Some(slot) => {
+                let val = acc.get_value(slot);
+                Ok(Some(V::as_bytes(&val).as_ref().to_vec()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Insert a new `(key, value)` pair. Returns `DuplicateKey` if a visible
+    /// version already exists under `txn`'s snapshot.
+    pub fn insert(
+        &self,
+        key: &K::SelfType<'_>,
+        value: &V::SelfType<'_>,
+        txn: &Transaction,
+    ) -> Result<()> {
+        let key_bytes = K::as_bytes(key);
+        let key_len = key_bytes.as_ref().len();
+
+        if key_len > MAX_KEY_SIZE {
+            return Err(IndexError::KeyTooLarge { size: key_len, max: MAX_KEY_SIZE });
+        }
+
+        let root_pid = *self.root.lock().unwrap();
+        let mut stack = BTStack::new();
+        let mut pid = root_pid;
+
+        // ── Phase 1: Optimistic descent (shared latches only) ────────────
+        let leaf_pid = loop {
+            let page = self.pool.fetch_page(pid)?;
+            match page[0] {
+                INTERNAL => {
+                    let acc = InternalPageAccessor::<K>::new(&page[..]);
+                    if let Some(hk) = acc.high_key_bytes() {
+                        if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
+                            let right = acc.rightlink().unwrap();
+                            drop(page);
+                            pid = right;
+                            continue;
+                        }
+                    }
+                    let (_, child_pid) = acc.find_child(key);
+                    stack.push(BTStackEntry { page_id: pid });
+                    drop(page);
+                    pid = child_pid;
+                }
+                LEAF => { drop(page); break pid; }
+                found => return Err(IndexError::UnexpectedPageType { expected: LEAF, found }),
+            }
+        };
+
+        // ── Phase 2: Exclusive latch on leaf + rightlink correction ──────
+        let mut leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
+        loop {
+            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+            if let Some(hk) = acc.high_key_bytes() {
+                if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
+                    let right = acc.rightlink().unwrap();
+                    drop(leaf_guard);
+                    leaf_guard = self.pool.fetch_page_mut(right)?;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        // ── Phase 3: Conflict detection + insert ─────────────────────────
+        let (slot, exact) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
+
+        if exact {
+            // Key exists — check for conflicts among duplicate versions.
+            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+            self.check_insert_conflict(&acc, slot, key, txn)?;
+        }
+
+        // Insert new record.
+        let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
+            .insert(slot, key, value);
+
+        match result {
+            Ok(()) => {
+                // Set xmin to the inserting transaction.
+                LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
+                    .set_xmin(slot, txn.txn_id);
+                return Ok(());
+            }
+            Err(_) => {
+                return self.split_and_insert(leaf_guard, key, value, txn.txn_id, &mut stack);
+            }
+        }
+    }
+
+    /// Delete `key` by setting xmax on the visible version.
+    pub fn delete(&self, key: &K::SelfType<'_>, txn: &Transaction) -> Result<()> {
+        let root_pid = *self.root.lock().unwrap();
+        let key_bytes = K::as_bytes(key);
+        let mut pid = root_pid;
+
+        // Optimistic descent.
+        let leaf_pid = loop {
+            let page = self.pool.fetch_page(pid)?;
+            match page[0] {
+                INTERNAL => {
+                    let acc = InternalPageAccessor::<K>::new(&page[..]);
+                    if let Some(hk) = acc.high_key_bytes() {
+                        if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
+                            let right = acc.rightlink().unwrap();
+                            drop(page);
+                            pid = right;
+                            continue;
+                        }
+                    }
+                    let (_, child_pid) = acc.find_child(key);
+                    drop(page);
+                    pid = child_pid;
+                }
+                LEAF => { drop(page); break pid; }
+                found => return Err(IndexError::UnexpectedPageType { expected: LEAF, found }),
+            }
+        };
+
+        // Exclusive latch + rightlink correction.
+        let mut leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
+        loop {
+            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+            if let Some(hk) = acc.high_key_bytes() {
+                if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
+                    let right = acc.rightlink().unwrap();
+                    drop(leaf_guard);
+                    leaf_guard = self.pool.fetch_page_mut(right)?;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        // Find visible version.
+        let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+        let visible_slot = self.find_visible_slot(&acc, key, &txn.snapshot)
+            .ok_or(IndexError::KeyNotFound)?;
+
+        // Conflict check: has another in-progress txn already set xmax?
+        let rec_xmax = acc.get_xmax(visible_slot);
+        self.check_write_conflict(rec_xmax, txn)?;
+
+        // Set xmax to mark this version as deleted by our transaction.
+        LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
+            .set_xmax(visible_slot, txn.txn_id);
+
+        Ok(())
+    }
+
+    /// Update `key` with `new_value`. Atomically sets xmax on the old version
+    /// and inserts a new version — both under the same exclusive latch.
+    pub fn update(
+        &self,
+        key: &K::SelfType<'_>,
+        value: &V::SelfType<'_>,
+        txn: &Transaction,
+    ) -> Result<()> {
+        let key_bytes = K::as_bytes(key);
+        let key_len = key_bytes.as_ref().len();
+
+        if key_len > MAX_KEY_SIZE {
+            return Err(IndexError::KeyTooLarge { size: key_len, max: MAX_KEY_SIZE });
+        }
+
+        let root_pid = *self.root.lock().unwrap();
+        let mut stack = BTStack::new();
+        let mut pid = root_pid;
+
+        // Optimistic descent.
+        let leaf_pid = loop {
+            let page = self.pool.fetch_page(pid)?;
+            match page[0] {
+                INTERNAL => {
+                    let acc = InternalPageAccessor::<K>::new(&page[..]);
+                    if let Some(hk) = acc.high_key_bytes() {
+                        if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
+                            let right = acc.rightlink().unwrap();
+                            drop(page);
+                            pid = right;
+                            continue;
+                        }
+                    }
+                    let (_, child_pid) = acc.find_child(key);
+                    stack.push(BTStackEntry { page_id: pid });
+                    drop(page);
+                    pid = child_pid;
+                }
+                LEAF => { drop(page); break pid; }
+                found => return Err(IndexError::UnexpectedPageType { expected: LEAF, found }),
+            }
+        };
+
+        // Exclusive latch + rightlink correction.
+        let mut leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
+        loop {
+            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+            if let Some(hk) = acc.high_key_bytes() {
+                if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
+                    let right = acc.rightlink().unwrap();
+                    drop(leaf_guard);
+                    leaf_guard = self.pool.fetch_page_mut(right)?;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        // Find visible version under same exclusive latch.
+        let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+        let visible_slot = self.find_visible_slot(&acc, key, &txn.snapshot)
+            .ok_or(IndexError::KeyNotFound)?;
+
+        // Conflict check.
+        let rec_xmax = acc.get_xmax(visible_slot);
+        self.check_write_conflict(rec_xmax, txn)?;
+
+        // ── ATOMIC: set xmax on old + insert new (same latch) ────────────
+        LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
+            .set_xmax(visible_slot, txn.txn_id);
+
+        // Find insert position for the new version.
+        let (slot, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
+        let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
+            .insert(slot, key, value);
+
+        match result {
+            Ok(()) => {
+                LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
+                    .set_xmin(slot, txn.txn_id);
+                return Ok(());
+            }
+            Err(_) => {
+                return self.split_and_insert(leaf_guard, key, value, txn.txn_id, &mut stack);
+            }
+        }
+    }
+
+    /// Return a lazy iterator over entries visible to `txn`.
+    pub fn range<R>(&self, range: R, txn: &Transaction) -> RangeScan<'_, K, V>
+    where
+        K: 'static,
+        R: RangeBounds<K::SelfType<'static>>,
+    {
+        let root_pid = *self.root.lock().unwrap();
+
+        let (current_leaf, start_slot) = match range.start_bound() {
+            Bound::Included(k) => {
+                let leaf_pid = self.find_leaf(root_pid, k).expect("find_leaf failed");
+                let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
+                let (slot, _) = LeafPageAccessor::<K, V>::new(&page[..]).position(k);
+                (Some(leaf_pid), slot)
+            }
+            Bound::Excluded(k) => {
+                let leaf_pid = self.find_leaf(root_pid, k).expect("find_leaf failed");
+                let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
+                let (slot, exact) = LeafPageAccessor::<K, V>::new(&page[..]).position(k);
+                (Some(leaf_pid), if exact { slot + 1 } else { slot })
+            }
+            Bound::Unbounded => {
+                let leaf_pid = self.find_leftmost_leaf(root_pid).expect("find_leftmost failed");
+                (Some(leaf_pid), 0)
+            }
+        };
+
+        let (end_key, end_inclusive) = match range.end_bound() {
+            Bound::Included(k) => (Some(K::as_bytes(k).as_ref().to_vec()), true),
+            Bound::Excluded(k) => (Some(K::as_bytes(k).as_ref().to_vec()), false),
+            Bound::Unbounded   => (None, false),
+        };
+
+        RangeScan {
+            pool: &self.pool,
+            current_leaf,
+            slot: start_slot,
+            end_key,
+            end_inclusive,
+            snapshot: txn.snapshot.clone(),
+            _key: PhantomData,
+            _val: PhantomData,
+        }
+    }
+
+    // ── MVCC helpers ──────────────────────────────────────────────────────────
+
+    /// Scan among duplicate keys to find the version visible under `snap`.
+    ///
+    /// `position()` may return any slot among duplicates (binary search
+    /// doesn't guarantee the first). We scan backward to the first duplicate,
+    /// then forward through all of them looking for a visible version.
+    fn find_visible_slot(
+        &self,
+        acc: &LeafPageAccessor<'_, K, V>,
+        key: &K::SelfType<'_>,
+        snap: &Snapshot,
+    ) -> Option<usize> {
+        let key_bytes = K::as_bytes(key);
+        let key_ref = key_bytes.as_ref();
+        let (start, found) = acc.position(key);
+        if !found { return None; }
+
+        // Scan backward to find the first duplicate.
+        let mut first = start;
+        while first > 0 {
+            let prev_key_val = acc.get_key(first - 1);
+            let prev_key = K::as_bytes(&prev_key_val);
+            if K::compare(prev_key.as_ref(), key_ref) != Ordering::Equal {
+                break;
+            }
+            first -= 1;
+        }
+
+        // Scan forward from the first duplicate.
+        let n = acc.num_pairs() as usize;
+        let mut i = first;
+        while i < n {
+            let rec_key_val = acc.get_key(i);
+            let rec_key = K::as_bytes(&rec_key_val);
+            if K::compare(rec_key.as_ref(), key_ref) != Ordering::Equal {
+                break;
+            }
+            if is_visible(acc.get_xmin(i), acc.get_xmax(i), snap) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Check for insert conflicts among duplicate versions of `key`.
+    ///
+    /// Returns `DuplicateKey` if a visible version exists.
+    /// Returns `WriteConflict` if an in-progress txn has an uncommitted
+    /// insert (xmin in-progress) or uncommitted delete (xmax in-progress).
+    fn check_insert_conflict(
+        &self,
+        acc: &LeafPageAccessor<'_, K, V>,
+        start_slot: usize,
+        key: &K::SelfType<'_>,
+        txn: &Transaction,
+    ) -> Result<()> {
+        let key_bytes = K::as_bytes(key);
+        let key_ref = key_bytes.as_ref();
+        let n = acc.num_pairs() as usize;
+
+        // Scan backward to first duplicate (position may land anywhere).
+        let mut i = start_slot;
+        while i > 0 {
+            let prev_key_val = acc.get_key(i - 1);
+            let prev_key = K::as_bytes(&prev_key_val);
+            if K::compare(prev_key.as_ref(), key_ref) != Ordering::Equal { break; }
+            i -= 1;
+        }
+
+        while i < n {
+            let rec_key_val = acc.get_key(i);
+            let rec_key = K::as_bytes(&rec_key_val);
+            if K::compare(rec_key.as_ref(), key_ref) != Ordering::Equal {
+                break;
+            }
+
+            let xmin = acc.get_xmin(i);
+            let xmax = acc.get_xmax(i);
+
+            // If xmin is in-progress (uncommitted insert by another txn),
+            // that txn might commit → would create a duplicate.
+            if xmin != txn.txn_id && txn.snapshot.is_in_progress(xmin) {
+                // TODO! wait-for-commit: block until xmin txn commits/aborts
+                return Err(IndexError::WriteConflict);
+            }
+
+            // If the record is visible to us, it's a duplicate.
+            if is_visible(xmin, xmax, &txn.snapshot) {
+                return Err(IndexError::DuplicateKey);
+            }
+
+            // If xmax is in-progress (another txn is deleting this version),
+            // that deletion might abort → the record would reappear as live.
+            if xmax != 0 && xmax != txn.txn_id && txn.snapshot.is_in_progress(xmax) {
+                // TODO! wait-for-commit: block until xmax txn commits/aborts
+                return Err(IndexError::WriteConflict);
+            }
+
+            i += 1;
+        }
+        Ok(())
+    }
+
+    /// First-writer-wins conflict check before setting xmax on a record.
+    fn check_write_conflict(&self, rec_xmax: u64, txn: &Transaction) -> Result<()> {
+        if rec_xmax == 0 {
+            return Ok(()); // nobody has touched this version
+        }
+        if rec_xmax == txn.txn_id {
+            return Ok(()); // we already modified it (re-entrant)
+        }
+        if txn.snapshot.is_in_progress(rec_xmax) {
+            // Another active txn claimed this version → first writer wins → we lose.
+            return Err(IndexError::WriteConflict);
+        }
+        // The modifier committed → version is already dead.
+        // Caller will get KeyNotFound since find_visible_slot won't find it.
+        Ok(())
+    }
+
+    // ── Tree navigation ───────────────────────────────────────────────────────
+
+    fn find_leaf(&self, start_pid: PageId, key: &K::SelfType<'_>) -> Result<PageId> {
+        let mut pid = start_pid;
+        let mut parent_latch: Option<PageReadGuard<'_>> = None;
+
+        loop {
+            // acquired read guard on fetched page 
+            let page = self.pool.fetch_page(pid)?;
+            // dropped parent latch 
+            drop(parent_latch.take());
+
+            match page[0] {
+                INTERNAL => {
+                    let acc = InternalPageAccessor::<K>::new(&page[..]);
+                    // rightlink correction in case split happened before we acquired lock on child 
+                    if let Some(hk) = acc.high_key_bytes() {
+                        let key_b = K::as_bytes(key);
+                        if K::compare(key_b.as_ref(), hk) != Ordering::Less {
+                            let right = acc.rightlink().unwrap();
+                            drop(page);
+                            pid = right;
+                            continue;
+                        }
+                    }
+                    let (_, child_pid) = acc.find_child(key);
+                    parent_latch = Some(page);
+                    pid = child_pid;
+                }
+                LEAF => { drop(page); return Ok(pid); }
+                found => {
+                    drop(page);
+                    return Err(IndexError::UnexpectedPageType { expected: LEAF, found });
+                }
+            }
+        }
+    }
+
+    fn find_leftmost_leaf(&self, start_pid: PageId) -> Result<PageId> {
+        let mut pid = start_pid;
+        loop {
+            let page = self.pool.fetch_page(pid)?;
+            match page[0] {
+                INTERNAL => {
+                    let child = InternalPageAccessor::<K>::new(&page[..]).child_page_at(0);
+                    drop(page);
+                    pid = child;
+                }
+                LEAF => { drop(page); return Ok(pid); }
+                found => {
+                    drop(page);
+                    return Err(IndexError::UnexpectedPageType { expected: LEAF, found });
+                }
+            }
+        }
+    }
+
+    // ── Split ─────────────────────────────────────────────────────────────────
+
+    /// Split a full leaf then insert `(key, value)` into the correct half.
+    /// Takes ownership of `leaf_guard` so it can be dropped when inserting
+    /// into the right page. Propagates the new separator up via `stack`.
+    fn split_and_insert(
+        &self,
+        mut leaf_guard: PageWriteGuard<'_>,
+        key: &K::SelfType<'_>,
+        value: &V::SelfType<'_>,
+        txn_id: u64,
+        stack: &mut BTStack,
+    ) -> Result<()> {
+        let key_bytes = K::as_bytes(key);
+        let leaf_pid_actual = leaf_guard.page_id;
+        let split = self.split_leaf_ly(&mut leaf_guard)?;
+
+        let target_pid = if K::compare(key_bytes.as_ref(), split.separator_key.as_slice()) != Ordering::Less {
+            split.new_page_id
+        } else {
+            leaf_pid_actual
+        };
+
+        if target_pid == leaf_pid_actual {
+            let (s, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
+            LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
+                .insert(s, key, value)
+                .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+            LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
+                .set_xmin(s, txn_id);
+        } else {
+            drop(leaf_guard);
+            let mut right = self.pool.fetch_page_mut(target_pid)?;
+            let (s, _) = LeafPageAccessor::<K, V>::new(&right[..]).position(key);
+            LeafPageMutator::<K, V>::new(&mut right[..])
+                .insert(s, key, value)
+                .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+            LeafPageMutator::<K, V>::new(&mut right[..])
+                .set_xmin(s, txn_id);
+        }
+
+        self.insert_separator_via_stack(stack, split.separator_key, split.new_page_id)
+    }
+
+    fn split_leaf_ly(
+        &self,
+        leaf_guard: &mut crate::buffer_pool::PageWriteGuard<'_>,
+    ) -> Result<SplitResult> {
+        let leaf_pid = leaf_guard.page_id;
+        let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+        let n = acc.num_pairs() as usize;
+
+        // Find a split point where the key CHANGES.
+        // Start at n/2 and scan forward until we hit a different key.
+        // This ensures all versions of the same key stay on the same page.
+        let mid = {
+            let target = n / 2;
+            let target_key = K::as_bytes(&acc.get_key(target)).as_ref().to_vec();
+            let mut split_at = target;
+            // Scan forward past all slots with the same key as target.
+            while split_at < n {
+                let key_val = acc.get_key(split_at);
+                let k = K::as_bytes(&key_val);
+                if K::compare(k.as_ref(), &target_key) != Ordering::Equal {
+                    break;
+                }
+                split_at += 1;
+            }
+            // If we reached the end (all remaining keys are duplicates),
+            // try scanning backward from target instead.
+            if split_at >= n {
+                split_at = target;
+                while split_at > 0 {
+                    let key_val = acc.get_key(split_at - 1);
+                    let k = K::as_bytes(&key_val);
+                    if K::compare(k.as_ref(), &target_key) != Ordering::Equal {
+                        break;
+                    }
+                    split_at -= 1;
+                }
+            }
+            // If split_at is 0, the entire page has the same key
+            // (pathological case — can only happen if MAX versions of one key
+            // fill the page). Fall back to n/2 and accept the cross-page split.
+            if split_at == 0 { target } else { split_at }
+        };
+
+        let separator_key = K::as_bytes(&acc.get_key(mid)).as_ref().to_vec();
+        let old_rightlink = acc.rightlink();
+        let old_high_key: Option<Vec<u8>> = acc.high_key_bytes().map(|b| b.to_vec());
+
+        // Snapshot ALL entries (including dead versions) to preserve MVCC history.
+        let left_entries: Vec<(Vec<u8>, Vec<u8>, u64, u64)> = (0..mid)
+            .map(|i| {
+                let k = K::as_bytes(&acc.get_key(i)).as_ref().to_vec();
+                let v = V::as_bytes(&acc.get_value(i)).as_ref().to_vec();
+                (k, v, acc.get_xmin(i), acc.get_xmax(i))
+            })
+            .collect();
+
+        // Allocate right page.
+        let mut right_guard = self.pool.new_page()?;
+        let right_pid = right_guard.page_id;
+
+        {
+            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+            let mut builder = LeafPageBuilder::<K, V>::new(right_pid, &mut right_guard[..]);
+            if let Some(ref hk) = old_high_key {
+                builder.set_high_key(hk);
+            }
+            builder.set_rightlink(old_rightlink);
+            builder.set_prev_page(Some(leaf_pid));
+            for i in mid..n {
+                builder.push_with_mvcc(
+                    &acc.get_key(i), &acc.get_value(i),
+                    acc.get_xmin(i), acc.get_xmax(i),
+                );
+            }
+            builder.finish();
+        }
+
+        drop(right_guard);
+        if let Some(old_right_pid) = old_rightlink {
+            let mut old_right = self.pool.fetch_page_mut(old_right_pid)?;
+            LeafPageMutator::<K, V>::new(&mut old_right[..]).set_prev_page(Some(right_pid));
+        }
+
+        // Rebuild left page from scratch (high_key changes slot base).
+        {
+            let lsn = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).lsn();
+            let prev = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).prev_page();
+            let mut builder = LeafPageBuilder::<K, V>::new(leaf_pid, &mut leaf_guard[..]);
+            builder.set_high_key(&separator_key);
+            builder.set_rightlink(Some(right_pid));
+            builder.set_prev_page(prev);
+            for (k, v, xmin, xmax) in &left_entries {
+                builder.push_with_mvcc(
+                    &K::from_bytes(k), &V::from_bytes(v), *xmin, *xmax,
+                );
+            }
+            let mut m = builder.finish();
+            m.set_lsn(lsn);
+        }
+
+        Ok(SplitResult { separator_key, new_page_id: right_pid })
+    }
+
+    fn insert_separator_via_stack(
+        &self,
+        stack: &mut BTStack,
+        mut sep_key: Vec<u8>,
+        mut right_pid: PageId,
+    ) -> Result<()> {
+        loop {
+            if stack.is_empty() {
+                let old_root_pid = *self.root.lock().unwrap();
+                let mut new_root_guard = self.pool.new_page()?;
+                let new_root_pid = new_root_guard.page_id;
+
+                let mut builder = InternalPageBuilder::<K>::new(new_root_pid, &mut new_root_guard[..]);
+                builder.push_first_child(old_root_pid);
+                builder.push_key_and_right_child(&K::from_bytes(&sep_key), right_pid);
+                builder.finish();
+                drop(new_root_guard);
+
+                *self.root.lock().unwrap() = new_root_pid;
+                return Ok(());
+            }
+
+            let entry = stack.pop().unwrap();
+            let mut parent_pid = entry.page_id;
+
+            let mut parent_guard = self.pool.fetch_page_mut(parent_pid)?;
+            loop {
+                let acc = InternalPageAccessor::<K>::new(&parent_guard[..]);
+                if let Some(hk) = acc.high_key_bytes() {
+                    if K::compare(&sep_key, hk) != Ordering::Less {
+                        let right = acc.rightlink().unwrap();
+                        drop(parent_guard);
+                        parent_pid = right;
+                        parent_guard = self.pool.fetch_page_mut(parent_pid)?;
+                        continue;
+                    }
+                }
+                break;
+            }
+
+            let acc = InternalPageAccessor::<K>::new(&parent_guard[..]);
+            if acc.can_fit(sep_key.len()) {
+                let (idx, _) = acc.find_child(&K::from_bytes(&sep_key));
+                InternalPageMutator::<K>::new(&mut parent_guard[..])
+                    .insert_key_and_right_child(idx, &K::from_bytes(&sep_key), right_pid)
+                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+                return Ok(());
+            }
+
+            let parent_split = self.split_internal_ly(
+                &mut parent_guard, &sep_key, right_pid,
+            )?;
+            drop(parent_guard);
+
+            sep_key = parent_split.separator_key;
+            right_pid = parent_split.new_page_id;
+        }
+    }
+
+    fn split_internal_ly(
+        &self,
+        guard: &mut crate::buffer_pool::PageWriteGuard<'_>,
+        sep_key: &[u8],
+        right_child: PageId,
+    ) -> Result<SplitResult> {
+        let internal_pid = guard.page_id;
+        let acc = InternalPageAccessor::<K>::new(&guard[..]);
+        let n = acc.num_keys() as usize;
+
+        let old_rightlink = acc.rightlink();
+        let old_high_key: Option<Vec<u8>> = acc.high_key_bytes().map(|b| b.to_vec());
+
+        let mut children: Vec<PageId> = (0..=n).map(|i| acc.child_page_at(i)).collect();
+        let mut keys: Vec<Vec<u8>> = (0..n)
+            .map(|i| K::as_bytes(&acc.key_at(i)).as_ref().to_vec())
+            .collect();
+
+        let insert_idx = {
+            let mut lo = 0usize;
+            let mut hi = keys.len();
+            while lo < hi {
+                let mid_i = lo + (hi - lo) / 2;
+                if K::compare(&keys[mid_i], sep_key) == Ordering::Greater {
+                    hi = mid_i;
+                } else {
+                    lo = mid_i + 1;
+                }
+            }
+            lo
+        };
+        keys.insert(insert_idx, sep_key.to_vec());
+        children.insert(insert_idx + 1, right_child);
+
+        let total_keys = keys.len();
+        let mid = total_keys / 2;
+        let push_up_key = keys[mid].clone();
+
+        let mut right_guard = self.pool.new_page()?;
+        let right_pid = right_guard.page_id;
+        {
+            let mut builder = InternalPageBuilder::<K>::new(right_pid, &mut right_guard[..]);
+            builder.push_first_child(children[mid + 1]);
+            for i in (mid + 1)..total_keys {
+                builder.push_key_and_right_child(&K::from_bytes(&keys[i]), children[i + 1]);
+            }
+            builder.set_rightlink(old_rightlink);
+            if let Some(ref hk) = old_high_key {
+                builder.set_high_key(hk);
+            }
+            builder.finish();
+        }
+        drop(right_guard);
+
+        {
+            let lsn = InternalPageAccessor::<K>::new(&guard[..]).lsn();
+            let mut builder = InternalPageBuilder::<K>::new(internal_pid, &mut guard[..]);
+            builder.set_rightlink(Some(right_pid));
+            builder.set_high_key(&push_up_key);
+            builder.push_first_child(children[0]);
+            for i in 0..mid {
+                builder.push_key_and_right_child(&K::from_bytes(&keys[i]), children[i + 1]);
+            }
+            let mut m = builder.finish();
+            m.set_lsn(lsn);
+        }
+
+        Ok(SplitResult { separator_key: push_up_key, new_page_id: right_pid })
+    }
+}
+
+// ── RangeScan ─────────────────────────────────────────────────────────────────
+
+pub struct RangeScan<'a, K: Key, V: Value> {
+    pool: &'a BufferPoolManager,
+    current_leaf: Option<PageId>,
+    slot: usize,
+    end_key: Option<Vec<u8>>,
+    end_inclusive: bool,
+    snapshot: Snapshot,
+    _key: PhantomData<K>,
+    _val: PhantomData<V>,
+}
+
+impl<'a, K: Key, V: Value> Iterator for RangeScan<'a, K, V> {
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let leaf_pid = self.current_leaf?;
+            let page = match self.pool.fetch_page(leaf_pid) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e.into())),
+            };
+            let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+            let n = acc.num_pairs() as usize;
+
+            while self.slot < n {
+                let xmin = acc.get_xmin(self.slot);
+                let xmax = acc.get_xmax(self.slot);
+
+                // Skip records not visible to our snapshot.
+                if !is_visible(xmin, xmax, &self.snapshot) {
+                    self.slot += 1;
+                    continue;
+                }
+
+                let k = K::as_bytes(&acc.get_key(self.slot)).as_ref().to_vec();
+                let v = V::as_bytes(&acc.get_value(self.slot)).as_ref().to_vec();
+
+                let in_range = match &self.end_key {
+                    None => true,
+                    Some(end) => {
+                        let cmp = K::compare(&k, end);
+                        if self.end_inclusive { cmp != Ordering::Greater }
+                        else { cmp == Ordering::Less }
+                    }
+                };
+
+                if !in_range {
+                    self.current_leaf = None;
+                    return None;
+                }
+
+                self.slot += 1;
+                return Some(Ok((k, v)));
+            }
+
+            self.current_leaf = acc.rightlink();
+            self.slot = 0;
+        }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer_pool::manager::BufferPoolManager;
+    use crate::disk::DiskManager;
+    use common::MAX_PAGE_SIZE;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn make_index() -> BTreeIndex<&'static [u8], &'static [u8]> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        std::mem::forget(dir);
+        let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+        let pool = Arc::new(BufferPoolManager::new(disk));
+        let (index, _) = BTreeIndex::create(pool).unwrap();
+        index
+    }
+
+    fn auto() -> Transaction { Transaction::auto() }
+
+    fn leak_bytes(b: &[u8]) -> &'static [u8] {
+        Box::leak(b.to_vec().into_boxed_slice())
+    }
+
+    // ── Basic get / insert ────────────────────────────────────────────────
+
+    #[test]
+    fn get_missing_key_returns_none() {
+        let idx = make_index();
+        assert!(idx.get(&(&b"hello"[..]), &auto()).unwrap().is_none());
+    }
+
+    #[test]
+    fn insert_and_get_single_entry() {
+        let idx = make_index();
+        idx.insert(&(&b"key"[..]), &(&b"value"[..]), &auto()).unwrap();
+        let got = idx.get(&(&b"key"[..]), &auto()).unwrap().unwrap();
+        assert_eq!(got, b"value");
+    }
+
+    #[test]
+    fn insert_duplicate_returns_error() {
+        let idx = make_index();
+        idx.insert(&(&b"k"[..]), &(&b"v1"[..]), &auto()).unwrap();
+        match idx.insert(&(&b"k"[..]), &(&b"v2"[..]), &auto()) {
+            Err(IndexError::DuplicateKey) => {}
+            other => panic!("expected DuplicateKey, got {:?}", other),
+        }
+    }
+
+    // ── Update ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn update_returns_new_value() {
+        let idx = make_index();
+        idx.insert(&(&b"k"[..]), &(&b"v1"[..]), &auto()).unwrap();
+        idx.update(&(&b"k"[..]), &(&b"v2"[..]), &auto()).unwrap();
+        let got = idx.get(&(&b"k"[..]), &auto()).unwrap().unwrap();
+        assert_eq!(got, b"v2");
+    }
+
+    #[test]
+    fn update_missing_key_returns_error() {
+        let idx = make_index();
+        match idx.update(&(&b"nope"[..]), &(&b"v"[..]), &auto()) {
+            Err(IndexError::KeyNotFound) => {}
+            other => panic!("expected KeyNotFound, got {:?}", other),
+        }
+    }
+
+    // ── Delete ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn delete_missing_key_returns_error() {
+        let idx = make_index();
+        match idx.delete(&(&b"nope"[..]), &auto()) {
+            Err(IndexError::KeyNotFound) => {}
+            other => panic!("expected KeyNotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn insert_then_delete() {
+        let idx = make_index();
+        idx.insert(&(&b"k"[..]), &(&b"v"[..]), &auto()).unwrap();
+        idx.delete(&(&b"k"[..]), &auto()).unwrap();
+        assert!(idx.get(&(&b"k"[..]), &auto()).unwrap().is_none());
+    }
+
+    #[test]
+    fn insert_after_delete() {
+        let idx = make_index();
+        idx.insert(&(&b"k"[..]), &(&b"v1"[..]), &auto()).unwrap();
+        idx.delete(&(&b"k"[..]), &auto()).unwrap();
+        // After delete, insert a new version — should succeed (old is dead).
+        let r = idx.insert(&(&b"k"[..]), &(&b"v2"[..]), &auto());
+        assert!(r.is_ok(), "insert after delete failed: {:?}", r.err());
+        let got = idx.get(&(&b"k"[..]), &auto()).unwrap();
+        assert!(got.is_some(), "get returned None after insert-after-delete");
+        assert_eq!(got.unwrap(), b"v2");
+    }
+
+    // ── Sequential inserts / splits ──────────────────────────────────────
+
+    #[test]
+    fn sequential_inserts_all_readable() {
+        let idx = make_index();
+        for i in 0u64..200 {
+            let k = i.to_be_bytes();
+            let v = (i * 10).to_be_bytes();
+            idx.insert(&(k.as_ref()), &(v.as_ref()), &auto()).unwrap();
+        }
+        for i in 0u64..200 {
+            let k = i.to_be_bytes();
+            let expected = (i * 10).to_be_bytes();
+            let got = idx.get(&(k.as_ref()), &auto()).unwrap()
+                .unwrap_or_else(|| panic!("key {} missing", i));
+            assert_eq!(got, expected.as_ref());
+        }
+    }
+
+    #[test]
+    fn large_insert_all_keys_readable() {
+        let idx = make_index();
+        for i in 0u32..2000 {
+            let k = i.to_be_bytes();
+            let v = (i + 1).to_be_bytes();
+            idx.insert(&(k.as_ref()), &(v.as_ref()), &auto()).unwrap();
+        }
+        for i in 0u32..2000 {
+            let k = i.to_be_bytes();
+            let expected = (i + 1).to_be_bytes();
+            let got = idx.get(&(k.as_ref()), &auto()).unwrap()
+                .unwrap_or_else(|| panic!("key {} missing", i));
+            assert_eq!(got, expected.as_ref());
+        }
+    }
+
+    #[test]
+    fn reverse_order_inserts_all_readable() {
+        let idx = make_index();
+        for i in (0u32..500).rev() {
+            let k = i.to_be_bytes();
+            idx.insert(&(k.as_ref()), &(k.as_ref()), &auto()).unwrap();
+        }
+        for i in 0u32..500 {
+            let k = i.to_be_bytes();
+            let got = idx.get(&(k.as_ref()), &auto()).unwrap()
+                .unwrap_or_else(|| panic!("key {} missing", i));
+            assert_eq!(got, k.as_ref());
+        }
+    }
+
+    // ── Delete bulk ──────────────────────────────────────────────────────
+
+    #[test]
+    fn delete_half_keys_remaining_readable() {
+        let idx = make_index();
+        for i in 0u32..200 {
+            let k = i.to_be_bytes();
+            idx.insert(&(k.as_ref()), &(k.as_ref()), &auto()).unwrap();
+        }
+        for i in (0u32..200).filter(|x| x % 2 == 0) {
+            let k = i.to_be_bytes();
+            idx.delete(&(k.as_ref()), &auto()).unwrap();
+        }
+        for i in (0u32..200).filter(|x| x % 2 == 1) {
+            let k = i.to_be_bytes();
+            idx.get(&(k.as_ref()), &auto()).unwrap()
+                .unwrap_or_else(|| panic!("odd key {} missing", i));
+        }
+        for i in (0u32..200).filter(|x| x % 2 == 0) {
+            let k = i.to_be_bytes();
+            assert!(idx.get(&(k.as_ref()), &auto()).unwrap().is_none());
+        }
+    }
+
+    // ── Update bulk ──────────────────────────────────────────────────────
+
+    #[test]
+    fn stress_update_all_keys() {
+        let idx = make_index();
+        let n = 200u32;
+        for i in 0..n {
+            let k = i.to_be_bytes();
+            idx.insert(&(k.as_ref()), &(k.as_ref()), &auto()).unwrap();
+        }
+        for i in 0..n {
+            let k = i.to_be_bytes();
+            let v = (i + 1000).to_be_bytes();
+            idx.update(&(k.as_ref()), &(v.as_ref()), &auto()).unwrap();
+        }
+        for i in 0..n {
+            let k = i.to_be_bytes();
+            let expected = (i + 1000).to_be_bytes();
+            let got = idx.get(&(k.as_ref()), &auto()).unwrap()
+                .unwrap_or_else(|| panic!("key {} missing after update", i));
+            assert_eq!(got, expected.as_ref());
+        }
+    }
+
+    // ── Range scan ───────────────────────────────────────────────────────
+
+    #[test]
+    fn range_scan_full() {
+        let idx = make_index();
+        for i in 0u32..100 {
+            let k = i.to_be_bytes();
+            idx.insert(&(k.as_ref()), &(k.as_ref()), &auto()).unwrap();
+        }
+        let results: Vec<_> = idx.range::<std::ops::RangeFull>(.., &auto())
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(results.len(), 100);
+    }
+
+    #[test]
+    fn range_scan_skips_deleted() {
+        let idx = make_index();
+        for i in 0u32..10 {
+            let k = i.to_be_bytes();
+            idx.insert(&(k.as_ref()), &(k.as_ref()), &auto()).unwrap();
+        }
+        for &i in &[3u32, 5, 7] {
+            let k = i.to_be_bytes();
+            idx.delete(&(k.as_ref()), &auto()).unwrap();
+        }
+        let results: Vec<_> = idx.range::<std::ops::RangeFull>(.., &auto())
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(results.len(), 7);
+    }
+
+    #[test]
+    fn range_scan_bounded() {
+        let idx = make_index();
+        for i in 0u32..100 {
+            let k = i.to_be_bytes();
+            idx.insert(&(k.as_ref()), &(k.as_ref()), &auto()).unwrap();
+        }
+        let start: &'static [u8] = leak_bytes(&10u32.to_be_bytes());
+        let end: &'static [u8] = leak_bytes(&20u32.to_be_bytes());
+        let results: Vec<_> = idx.range(start..end, &auto())
+            .map(|r| r.unwrap()).collect();
+        assert_eq!(results.len(), 10);
+    }
+
+    // ── Write conflict ───────────────────────────────────────────────────
+
+    #[test]
+    fn write_conflict_on_concurrent_delete() {
+        let idx = make_index();
+        idx.insert(&(&b"k"[..]), &(&b"v"[..]), &auto()).unwrap();
+
+        // Simulate: txn 10 deletes the key (xmax = 10).
+        let txn10 = Transaction { txn_id: 10, snapshot: Snapshot::latest() };
+        idx.delete(&(&b"k"[..]), &txn10).unwrap();
+
+        // txn 20 tries to delete the same key. Txn 10 is in txn20's active list.
+        let txn20 = Transaction {
+            txn_id: 20,
+            snapshot: Snapshot { xmin: 1, xmax: 30, active: vec![10] },
+        };
+        match idx.delete(&(&b"k"[..]), &txn20) {
+            Err(IndexError::WriteConflict) => {}
+            other => panic!("expected WriteConflict, got {:?}", other),
+        }
     }
 }

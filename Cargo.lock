@@ -390,6 +390,7 @@ version = "0.1.0"
 dependencies = [
  "common",
  "crc32fast",
+ "db-core",
  "tempfile",
  "thiserror",
 ]

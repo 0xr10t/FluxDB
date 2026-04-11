@@ -371,6 +371,7 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
         if len > 0 {
             self.data[LEAF_HEADER_SIZE..LEAF_HEADER_SIZE + len].copy_from_slice(key_bytes);
         }
+        write_u16(self.data, OFF_LEAF_FREE_START, slot_base(len) as u16);
     }
 
     /// Borrow as a read-only accessor without releasing the mutable borrow.

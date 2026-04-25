@@ -1,19 +1,20 @@
 //! Internal (branch) page types for the B+Tree storage engine.
 //!
-//! ## Layout
+//! ## Layout (Lehman-Yao)
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────┐
 //! │ FIXED HEADER — 32 bytes (fully 8-byte aligned)          │
 //! ├────────┬───────────┬──────────────────────────────────  ┤
 //! │ Off  0 │ u8        │ page_type                           │
-//! │ Off  1 │ u8        │ flags (dirty, root, etc.)           │
+//! │ Off  1 │ u8        │ _reserved (0)                       │
 //! │ Off  2 │ u16       │ num_keys                            │
-//! │ Off  4 │ u32       │ ← padding: brings header to 8 bytes │
+//! │ Off  4 │ u16       │ high_key_len (0 = +∞ / rightmost)   │
+//! │ Off  6 │ u16       │ _padding                            │
 //! ├────────┼───────────┼───────────────────────────────────  ┤
 //! │ Off  8 │ u64       │ page_id          [8-byte aligned ✓] │
 //! │ Off 16 │ u64       │ lsn              [8-byte aligned ✓] │
-//! │ Off 24 │ u64       │ parent_page_id   [8-byte aligned ✓] │
+//! │ Off 24 │ u64       │ rightlink         [8-byte aligned ✓] │
 //! └────────┴───────────┴───────────────────────────────────  ┘
 //!
 //! ┌──────────────────────────────────────────────────────────┐
@@ -31,6 +32,12 @@
 //! │  key[i] spans [key_end[i-1], key_end[i])                 │
 //! │  (key_end[-1] == 0 by convention)                        │
 //! └──────────────────────────────────────────────────────────┘
+//!
+//! ┌──────────────────────────────────────────────────────────┐
+//! │ HIGH KEY — stored at page[PAGE_SIZE - high_key_len ..]   │
+//! │  The exclusive upper bound for keys on this page.        │
+//! │  If high_key_len == 0, this is the rightmost page (+∞).  │
+//! └──────────────────────────────────────────────────────────┘
 //! ```
 
 use std::cmp::Ordering;
@@ -46,10 +53,11 @@ use super::{
 
 // ── Internal-page-specific header offsets ────────────────────────────────────
 
-const OFF_INT_NUM_KEYS: usize = 2;   // u16
-// bytes 4..8: u32 padding to keep the 8-byte fields aligned
-const OFF_INT_PARENT:   usize = 24;  // u64
-const INT_HEADER_SIZE:  usize = 32;
+const OFF_INT_NUM_KEYS:     usize = 2;   // u16
+const OFF_INT_HIGH_KEY_LEN: usize = 4;   // u16
+// bytes 6..8: u16 padding
+const OFF_INT_RIGHTLINK:    usize = 24;  // u64
+const INT_HEADER_SIZE:      usize = 32;
 
 // ── Offset calculation helpers ────────────────────────────────────────────────
 
@@ -93,8 +101,7 @@ impl<'a, K: Key> InternalPageAccessor<'a, K> {
     /// Wraps a raw page buffer.
     ///
     /// # Panics
-    /// Panics if the page-type byte does not equal [`INTERNAL`]. This indicates
-    /// a programming error (wrong page handed to the wrong accessor).
+    /// Panics if the page-type byte does not equal [`INTERNAL`].
     pub fn new(data: &'a [u8]) -> Self {
         assert_eq!(
             read_u8(data, OFF_PAGE_TYPE), INTERNAL,
@@ -115,12 +122,31 @@ impl<'a, K: Key> InternalPageAccessor<'a, K> {
         read_u16(self.data, OFF_INT_NUM_KEYS)
     }
 
-    /// Returns the parent page ID, or `None` if this is the root.
-    pub fn parent_page_id(&self) -> Option<PageId> {
-        match read_u64(self.data, OFF_INT_PARENT) {
+    /// Returns the right sibling page ID, or `None` if this is the rightmost
+    /// page at this level.
+    pub fn rightlink(&self) -> Option<PageId> {
+        match read_u64(self.data, OFF_INT_RIGHTLINK) {
             0 => None,
             v => Some(v),
         }
+    }
+
+    /// Length of the high key in bytes. 0 means this is the rightmost page
+    /// at this level (high key is +infinity).
+    pub fn high_key_len(&self) -> u16 {
+        read_u16(self.data, OFF_INT_HIGH_KEY_LEN)
+    }
+
+    /// Raw high key bytes, or `None` if this is the rightmost page (+infinity).
+    pub fn high_key_bytes(&self) -> Option<&'a [u8]> {
+        let len = self.high_key_len() as usize;
+        if len == 0 { return None; }
+        Some(&self.data[super::PAGE_SIZE - len..super::PAGE_SIZE])
+    }
+
+    /// Deserialized high key, or `None` if rightmost (+infinity).
+    pub fn high_key(&self) -> Option<K::SelfType<'a>> {
+        self.high_key_bytes().map(K::from_bytes)
     }
 
     pub fn child_page_at(&self, i: usize) -> PageId {
@@ -151,23 +177,27 @@ impl<'a, K: Key> InternalPageAccessor<'a, K> {
                 Ordering::Less | Ordering::Equal => low = mid + 1,
             }
         }
-        // `low` is the index of the first separator > search_key,
-        // which equals the child index to descend into.
         (low, self.child_page_at(low))
     }
 
-    /// Contiguous free bytes remaining in this page.
+    /// Contiguous free bytes remaining in this page (accounting for high key).
     pub fn free_bytes(&self) -> usize {
-        super::PAGE_SIZE - self.used_bytes()
+        super::PAGE_SIZE
+            .saturating_sub(self.used_bytes())
+            .saturating_sub(self.high_key_len() as usize)
     }
 
     /// Returns `true` if a new key of `key_len` bytes would fit on this page.
     pub fn can_fit(&self, key_len: usize) -> bool {
-        // One more key+child needs:
-        //   8 bytes  → child page ID (Section A)
-        //   4 bytes  → key_end entry (Section B)
-        //   key_len  → raw key bytes (Section C)
         self.free_bytes() >= 8 + 4 + key_len
+    }
+
+    /// Returns `true` if more than half the page is currently free.
+    ///
+    /// Used by the rebalance/vacuum paths to check whether a sibling can donate
+    /// entries or whether a parent needs rebalancing after a merge.
+    pub fn is_underfull(&self) -> bool {
+        self.free_bytes() * 2 > super::PAGE_SIZE
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -223,8 +253,19 @@ impl<'a, K: Key> InternalPageMutator<'a, K> {
         write_u64(self.data, OFF_LSN, lsn);
     }
 
-    pub fn set_parent_page_id(&mut self, parent: Option<PageId>) {
-        write_u64(self.data, OFF_INT_PARENT, parent.unwrap_or(0));
+    pub fn set_rightlink(&mut self, right: Option<PageId>) {
+        write_u64(self.data, OFF_INT_RIGHTLINK, right.unwrap_or(0));
+    }
+
+    /// Write the high key. `key_bytes` is stored at the end of the page.
+    /// Pass an empty slice (or call with `&[]`) for the rightmost page (+infinity).
+    pub fn set_high_key(&mut self, key_bytes: &[u8]) {
+        let len = key_bytes.len();
+        write_u16(self.data, OFF_INT_HIGH_KEY_LEN, len as u16);
+        if len > 0 {
+            let start = super::PAGE_SIZE - len;
+            self.data[start..super::PAGE_SIZE].copy_from_slice(key_bytes);
+        }
     }
 
     /// Update a child pointer in-place (e.g. after a split assigns a new ID).
@@ -283,11 +324,59 @@ impl<'a, K: Key> InternalPageMutator<'a, K> {
         self.rewrite(&children, &keys);
     }
 
+    // ── Separator helpers ─────────────────────────────────────────────────────
+
+    /// Replace `key[index]` with `new_key`, leaving children unchanged.
+    pub fn update_separator_at(&mut self, index: usize, new_key: &K::SelfType<'_>) {
+        let (children, mut keys) = self.snapshot();
+        keys[index] = K::as_bytes(new_key).as_ref().to_vec();
+        self.rewrite(&children, &keys);
+    }
+
+    /// Insert `new_key` before `key[0]` and `new_leftmost_child` before `child[0]`.
+    pub fn prepend_separator(&mut self, new_key: &K::SelfType<'_>, new_leftmost_child: PageId) {
+        let (mut children, mut keys) = self.snapshot();
+        children.insert(0, new_leftmost_child);
+        keys.insert(0, K::as_bytes(new_key).as_ref().to_vec());
+        self.rewrite(&children, &keys);
+    }
+
+    // ── Truncate ──────────────────────────────────────────────────────────────
+
+    /// Shrink this page to `num_keys` separator keys (and `num_keys + 1` children).
+    ///
+    /// All header fields (`page_id`, `lsn`, `rightlink`, `high_key`) are preserved
+    /// because [`Self::rewrite`] only touches `num_keys` and Sections A/B/C.
+    ///
+    /// No-op if `num_keys >= current num_keys`.
+    pub fn truncate_to(&mut self, num_keys: usize) {
+        let n = read_u16(self.data, OFF_INT_NUM_KEYS) as usize;
+        if num_keys >= n {
+            return;
+        }
+
+        let children: Vec<PageId> = (0..=num_keys)
+            .map(|i| read_u64(self.data, int_child_offset(i)))
+            .collect();
+
+        let base = int_key_data_base(n);
+        let keys: Vec<Vec<u8>> = (0..num_keys)
+            .map(|i| {
+                let start = if i == 0 {
+                    0
+                } else {
+                    read_u32(self.data, int_key_end_offset(n, i - 1)) as usize
+                };
+                let end = read_u32(self.data, int_key_end_offset(n, i)) as usize;
+                self.data[base + start..base + end].to_vec()
+            })
+            .collect();
+
+        self.rewrite(&children, &keys);
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    /// Copy all children and keys into owned `Vec`s so they can be modified
-    /// before being written back. Required because any change to `num_keys`
-    /// shifts every section offset.
     fn snapshot(&self) -> (Vec<PageId>, Vec<Vec<u8>>) {
         let n = read_u16(self.data, OFF_INT_NUM_KEYS) as usize;
 
@@ -311,8 +400,6 @@ impl<'a, K: Key> InternalPageMutator<'a, K> {
         (children, keys)
     }
 
-    /// Write children and keys back to the page using the correct section
-    /// layout. `num_keys` is derived from `keys.len()`.
     fn rewrite(&mut self, children: &[PageId], keys: &[Vec<u8>]) {
         let new_n = keys.len();
         write_u16(self.data, OFF_INT_NUM_KEYS, new_n as u16);
@@ -337,9 +424,6 @@ impl<'a, K: Key> InternalPageMutator<'a, K> {
 }
 
 // ── InternalPageBuilder ───────────────────────────────────────────────────────
-//
-// Keys are buffered in `keys` and written all at once in `finish()` because
-// every section offset depends on the final `num_keys`.
 
 /// Write-once constructor for a fresh internal page.
 pub struct InternalPageBuilder<'a, K: Key> {
@@ -351,18 +435,17 @@ pub struct InternalPageBuilder<'a, K: Key> {
 
 impl<'a, K: Key> InternalPageBuilder<'a, K> {
     /// Zero the buffer, stamp the page type and page ID.
+    /// Rightlink and high_key default to 0 (rightmost, +infinity).
     pub fn new(page_id: PageId, data: &'a mut [u8]) -> Self {
         data.fill(0);
         write_u8 (data, OFF_PAGE_TYPE, INTERNAL);
         write_u64(data, OFF_PAGE_ID,   page_id);
+        // rightlink = 0 (rightmost), high_key_len = 0 (+infinity) — already zero
         Self { data, keys: Vec::new(), children: Vec::new(), _key: PhantomData }
     }
 
     /// Register the leftmost child. Must be called exactly once, before any
     /// `push_key_and_right_child` calls.
-    ///
-    /// # Panics
-    /// Panics if called more than once (programming error).
     pub fn push_first_child(&mut self, child: PageId) {
         assert!(
             self.children.is_empty(),
@@ -373,9 +456,6 @@ impl<'a, K: Key> InternalPageBuilder<'a, K> {
 
     /// Append a separator key and the right child that follows it.
     /// Keys must be pushed in strictly ascending order.
-    ///
-    /// # Panics
-    /// Panics if `push_first_child` has not been called yet.
     pub fn push_key_and_right_child(&mut self, key: &K::SelfType<'_>, right_child: PageId) {
         assert!(
             !self.children.is_empty(),
@@ -386,8 +466,24 @@ impl<'a, K: Key> InternalPageBuilder<'a, K> {
         self.children.push(right_child);
     }
 
+    /// Set the right sibling page ID. Call before `finish()`.
+    pub fn set_rightlink(&mut self, right: Option<PageId>) {
+        write_u64(self.data, OFF_INT_RIGHTLINK, right.unwrap_or(0));
+    }
+
+    /// Set the high key (exclusive upper bound). Call before `finish()`.
+    /// Pass `&[]` for the rightmost page (+infinity).
+    pub fn set_high_key(&mut self, key_bytes: &[u8]) {
+        let len = key_bytes.len();
+        write_u16(self.data, OFF_INT_HIGH_KEY_LEN, len as u16);
+        if len > 0 {
+            let start = super::PAGE_SIZE - len;
+            self.data[start..super::PAGE_SIZE].copy_from_slice(key_bytes);
+        }
+    }
+
     /// Seal the page: flush all buffered data with the correct layout, then
-    /// return a mutator for remaining header writes (lsn, parent).
+    /// return a mutator for remaining header writes (lsn, etc.).
     pub fn finish(self) -> InternalPageMutator<'a, K> {
         let Self { data, keys, children, .. } = self;
         let num_keys = keys.len();
@@ -460,28 +556,60 @@ mod tests {
     }
 
     #[test]
-    fn lsn_and_parent_round_trip() {
-        let buf = build_page(7, 1, &[(&[42], 2)]);
-        let mut buf = buf;
-        let mut mutator = InternalPageMutator::<&[u8]>::new(buf.memory_mut());
-        mutator.set_lsn(99);
-        mutator.set_parent_page_id(Some(55));
-
+    fn rightlink_round_trip() {
+        let mut buf = build_page(7, 1, &[(&[42], 2)]);
+        {
+            let mut m = InternalPageMutator::<&[u8]>::new(buf.memory_mut());
+            m.set_rightlink(Some(99));
+        }
         let acc = InternalPageAccessor::<&[u8]>::new(buf.memory());
-        assert_eq!(acc.lsn(), 99);
-        assert_eq!(acc.parent_page_id(), Some(55));
+        assert_eq!(acc.rightlink(), Some(99));
     }
 
     #[test]
-    fn parent_page_id_none_when_zero() {
+    fn rightlink_none_when_zero() {
         let buf = build_page(1, 10, &[]);
         let acc = InternalPageAccessor::<&[u8]>::new(buf.memory());
-        assert_eq!(acc.parent_page_id(), None);
+        assert_eq!(acc.rightlink(), None);
+    }
+
+    #[test]
+    fn high_key_round_trip() {
+        let mut buf = PageBuffer::new();
+        {
+            let mut builder = InternalPageBuilder::<&[u8]>::new(1, buf.memory_mut());
+            builder.push_first_child(10);
+            builder.push_key_and_right_child(&(&[5][..]), 20);
+            builder.set_high_key(&[42, 43]);
+            builder.set_rightlink(Some(99));
+            builder.finish();
+        }
+        let acc = InternalPageAccessor::<&[u8]>::new(buf.memory());
+        assert_eq!(acc.high_key_len(), 2);
+        assert_eq!(acc.high_key_bytes(), Some(&[42u8, 43][..]));
+        assert_eq!(acc.high_key(), Some(&[42u8, 43][..]));
+        assert_eq!(acc.rightlink(), Some(99));
+    }
+
+    #[test]
+    fn high_key_none_when_rightmost() {
+        let buf = build_page(1, 10, &[]);
+        let acc = InternalPageAccessor::<&[u8]>::new(buf.memory());
+        assert_eq!(acc.high_key_len(), 0);
+        assert_eq!(acc.high_key_bytes(), None);
+        assert_eq!(acc.high_key(), None);
+    }
+
+    #[test]
+    fn lsn_round_trip() {
+        let mut buf = build_page(7, 1, &[(&[42], 2)]);
+        InternalPageMutator::<&[u8]>::new(buf.memory_mut()).set_lsn(99);
+        let acc = InternalPageAccessor::<&[u8]>::new(buf.memory());
+        assert_eq!(acc.lsn(), 99);
     }
 
     #[test]
     fn find_child_binary_search() {
-        // keys: [10, 20, 30]  children: [1, 2, 3, 4]
         let buf = build_page(
             1,
             1,
@@ -489,30 +617,20 @@ mod tests {
         );
         let acc = InternalPageAccessor::<&[u8]>::new(buf.memory());
 
-        // Anything < 10 → child 0
         let (idx, pid) = acc.find_child(&(&[5][..]));
-        assert_eq!(idx, 0);
-        assert_eq!(pid, 1);
+        assert_eq!(idx, 0); assert_eq!(pid, 1);
 
-        // Exactly 10 → child 1 (key[mid] == search: low = mid+1)
         let (idx, pid) = acc.find_child(&(&[10][..]));
-        assert_eq!(idx, 1);
-        assert_eq!(pid, 2);
+        assert_eq!(idx, 1); assert_eq!(pid, 2);
 
-        // Between 10 and 20 → child 1
         let (idx, pid) = acc.find_child(&(&[15][..]));
-        assert_eq!(idx, 1);
-        assert_eq!(pid, 2);
+        assert_eq!(idx, 1); assert_eq!(pid, 2);
 
-        // Exactly 30 → child 3
         let (idx, pid) = acc.find_child(&(&[30][..]));
-        assert_eq!(idx, 3);
-        assert_eq!(pid, 4);
+        assert_eq!(idx, 3); assert_eq!(pid, 4);
 
-        // Greater than all keys → child 3
         let (idx, pid) = acc.find_child(&(&[99][..]));
-        assert_eq!(idx, 3);
-        assert_eq!(pid, 4);
+        assert_eq!(idx, 3); assert_eq!(pid, 4);
     }
 
     #[test]
@@ -533,8 +651,6 @@ mod tests {
 
     #[test]
     fn insert_returns_err_when_full() {
-        // Build a page, then fill it via repeated mutator inserts until a
-        // further insert fails with InsufficientSpace.
         let mut buf = PageBuffer::new();
         {
             let mut b = InternalPageBuilder::<&[u8]>::new(1, buf.memory_mut());
@@ -559,8 +675,6 @@ mod tests {
 
     #[test]
     fn remove_key_keep_left_child() {
-        // keys: [10, 20]  children: [1, 2, 3]
-        // Remove key[0]=10, keep child[0]=1 (drop child[1]=2)
         let mut buf = build_page(1, 1, &[(&[10], 2), (&[20], 3)]);
         InternalPageMutator::<&[u8]>::new(buf.memory_mut())
             .remove_key_at(0, ChildSide::Left);
@@ -574,8 +688,6 @@ mod tests {
 
     #[test]
     fn remove_key_keep_right_child() {
-        // keys: [10, 20]  children: [1, 2, 3]
-        // Remove key[0]=10, keep child[1]=2 (drop child[0]=1)
         let mut buf = build_page(1, 1, &[(&[10], 2), (&[20], 3)]);
         InternalPageMutator::<&[u8]>::new(buf.memory_mut())
             .remove_key_at(0, ChildSide::Right);
@@ -603,8 +715,29 @@ mod tests {
             .insert_key_and_right_child(0, &(&[42u8][..]), 2)
             .unwrap();
         let free_after = InternalPageAccessor::<&[u8]>::new(buf.memory()).free_bytes();
-        // 8 (child ptr) + 4 (key_end entry) + 1 (key byte)
         assert_eq!(free_before - free_after, 8 + 4 + 1);
+    }
+
+    #[test]
+    fn free_bytes_accounts_for_high_key() {
+        let mut buf = PageBuffer::new();
+        {
+            let mut b = InternalPageBuilder::<&[u8]>::new(1, buf.memory_mut());
+            b.push_first_child(10);
+            b.set_high_key(&[1, 2, 3, 4, 5]); // 5 bytes
+            b.finish();
+        }
+        let free_with_hk = InternalPageAccessor::<&[u8]>::new(buf.memory()).free_bytes();
+
+        let mut buf2 = PageBuffer::new();
+        {
+            let mut b = InternalPageBuilder::<&[u8]>::new(1, buf2.memory_mut());
+            b.push_first_child(10);
+            b.finish();
+        }
+        let free_without_hk = InternalPageAccessor::<&[u8]>::new(buf2.memory()).free_bytes();
+
+        assert_eq!(free_without_hk - free_with_hk, 5);
     }
 
     #[test]
@@ -613,7 +746,7 @@ mod tests {
         let mut buf = PageBuffer::new();
         let mut b = InternalPageBuilder::<&[u8]>::new(1, buf.memory_mut());
         b.push_first_child(1);
-        b.push_first_child(2); // must panic
+        b.push_first_child(2);
     }
 
     #[test]
@@ -621,6 +754,6 @@ mod tests {
     fn push_key_without_first_child_panics() {
         let mut buf = PageBuffer::new();
         let mut b = InternalPageBuilder::<&[u8]>::new(1, buf.memory_mut());
-        b.push_key_and_right_child(&(&[1][..]), 2); // must panic
+        b.push_key_and_right_child(&(&[1][..]), 2);
     }
 }

@@ -76,7 +76,7 @@ impl TransactionManager {
     pub fn is_committed(&self, txn_id: u64) -> bool {
         if txn_id == 0 {
             return true;
-        } 
+        }
         self.clog.read().unwrap().get(&txn_id) == Some(&TransactionStatus::Committed)
     }
 
@@ -97,5 +97,92 @@ impl TransactionManager {
             xmax,
             active: active.iter().cloned().collect(),
         }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_begin_transaction() {
+        let tm = TransactionManager::new();
+        let txn = tm.begin();
+
+        assert_eq!(txn.snapshot.active.len(), 1);
+        assert_eq!(txn.snapshot.active[0], txn.txn_id);
+        assert!(tm.is_active(txn.txn_id));
+        assert!(!tm.is_committed(txn.txn_id));
+        assert!(!tm.is_aborted(txn.txn_id));
+    }
+
+    #[test]
+    fn test_commit_transaction() {
+        let tm = TransactionManager::new();
+        let txn = tm.begin();
+
+        tm.commit(txn.txn_id);
+
+        assert!(!tm.is_active(txn.txn_id));
+        assert!(tm.is_committed(txn.txn_id));
+        assert!(!tm.is_aborted(txn.txn_id));
+    }
+
+    #[test]
+    fn test_abort_transaction() {
+        let tm = TransactionManager::new();
+        let txn = tm.begin();
+
+        tm.abort(txn.txn_id);
+
+        assert!(!tm.is_active(txn.txn_id));
+        assert!(!tm.is_committed(txn.txn_id));
+        assert!(tm.is_aborted(txn.txn_id));
+    }
+
+    #[test]
+    fn test_snapshot_empty_active() {
+        let tm = TransactionManager::new();
+        let snap = tm.get_snapshot();
+
+        // When empty, xmin should equal xmax
+        assert_eq!(snap.xmin, snap.xmax);
+        assert!(snap.active.is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_with_multiple_active() {
+        let tm = TransactionManager::new();
+        let txn1 = tm.begin();
+        let txn2 = tm.begin();
+
+        let snap = tm.get_snapshot();
+
+        assert_eq!(snap.xmin, txn1.txn_id); // txn1 is the oldest active
+        assert!(snap.xmax > txn2.txn_id);
+        assert!(snap.active.contains(&txn1.txn_id));
+        assert!(snap.active.contains(&txn2.txn_id));
+        assert_eq!(snap.active.len(), 2);
+    }
+
+    #[test]
+    fn test_snapshot_with_commits_in_middle() {
+        let tm = TransactionManager::new();
+        let txn1 = tm.begin();
+        let txn2 = tm.begin();
+        let txn3 = tm.begin();
+
+        // Commit txn2 in the middle
+        tm.commit(txn2.txn_id);
+
+        let snap = tm.get_snapshot();
+
+        assert_eq!(snap.xmin, txn1.txn_id); // txn1 is still oldest
+        assert!(!snap.active.contains(&txn2.txn_id)); // txn2 committed
+        assert!(snap.active.contains(&txn1.txn_id));
+        assert!(snap.active.contains(&txn3.txn_id));
+        assert_eq!(snap.active.len(), 2);
     }
 }

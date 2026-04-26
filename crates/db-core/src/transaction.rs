@@ -21,7 +21,7 @@
 //! by an active transaction, the current transaction loses (returns
 //! `WriteConflict`). The first transaction to set `xmax` wins.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::AtomicU64;
 
 pub static TXN_ID: AtomicU64 = AtomicU64::new(1);
 

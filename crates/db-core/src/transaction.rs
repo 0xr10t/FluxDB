@@ -21,6 +21,10 @@
 //! by an active transaction, the current transaction loses (returns
 //! `WriteConflict`). The first transaction to set `xmax` wins.
 
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+pub static TXN_ID: AtomicU64 = AtomicU64::new(1);
+
 /// A transaction's identity and its point-in-time view of the database.
 ///
 /// All B+Tree operations (`get`, `insert`, `delete`, `update`, `range`)
@@ -41,7 +45,7 @@ impl Transaction {
     /// no transaction manager is wired.
     pub fn auto() -> Self {
         Self {
-            txn_id: 1,
+            txn_id: TXN_ID.fetch_add(1, Relaxed),
             snapshot: Snapshot::latest(),
         }
     }

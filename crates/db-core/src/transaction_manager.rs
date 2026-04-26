@@ -1,3 +1,29 @@
+//! Thread-safe transaction lifecycle and snapshot state management.
+//!
+//! The `TransactionManager` acts as the global coordinator for MVCC architecture.
+//! It issues sequentially increasing transaction IDs, builds accurate point-in-time
+//! `Snapshot`s for read isolation, and maintains the Commit Log (CLOG) that tracks
+//! whether a transaction is Active, Committed, or Aborted.
+//!
+//! ## Concurrency and Thread Safety
+//!
+//! Acquiring consistent snapshots in a multi-threaded codebase requires strict lock
+//! ordering. When a transaction calls `begin()`, the manager acquires a write-lock
+//! on the `active_txns` set *before* fetching the next global transaction ID.
+//! This guarantees that if a concurrent transaction is busy acquiring a snapshot,
+//! no new transaction ID can slip between the ID increment and insertion into the
+//! active set, avoiding critical race conditions that would break snapshot isolation.
+//!
+//! ## MVCC State Transitions
+//!
+//! 1. **Active**: The transaction begins. It receives a `txn_id` and a `Snapshot` and
+//!    is tracked inside `active_txns`. Its writes remain invisible to others.
+//! 2. **Committed**: The transaction finishes successfully. It is recorded as `Committed`
+//!    in the CLOG and safely removed from `active_txns`. Other new snapshots will see its writes.
+//! 3. **Aborted**: The transaction is explicitly rolled back (or fails a conflict check).
+//!    It is recorded as `Aborted` in the CLOG and removed from `active_txns`. Its writes
+//!    will remain invisible to all future transactions and can be garbage collected.
+
 use std::sync::atomic::Ordering::Relaxed;
 use std::{
     collections::{HashMap, HashSet},
@@ -6,6 +32,7 @@ use std::{
 
 use crate::transaction::{Snapshot, TXN_ID, Transaction};
 
+/// Represents the deterministic final state of a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionStatus {
     Active,
@@ -13,6 +40,8 @@ pub enum TransactionStatus {
     Aborted,
 }
 
+/// Global tracking for MVCC isolation rules and the commit log (CLOG).
+#[derive(Debug)]
 pub struct TransactionManager {
     pub clog: RwLock<HashMap<u64, TransactionStatus>>,
     pub active_txns: RwLock<HashSet<u64>>,
@@ -26,7 +55,7 @@ impl TransactionManager {
         }
     }
 
-    pub fn begin(&self) -> Transaction {
+    pub fn begin(self: &std::sync::Arc<Self>) -> Transaction {
         // Write-lock active_txns FIRST to prevent race conditions with get_snapshot.
         // We must lock before fetching TXN_ID to ensure that no snapshot is
         // generated in between ID creation and active set insertion.
@@ -53,6 +82,7 @@ impl TransactionManager {
                 xmax,
                 active: active_vec,
             },
+            tm: std::sync::Arc::clone(self),
         }
     }
 
@@ -108,7 +138,7 @@ mod tests {
 
     #[test]
     fn test_begin_transaction() {
-        let tm = TransactionManager::new();
+        let tm = std::sync::Arc::new(TransactionManager::new());
         let txn = tm.begin();
 
         assert_eq!(txn.snapshot.active.len(), 1);
@@ -120,7 +150,7 @@ mod tests {
 
     #[test]
     fn test_commit_transaction() {
-        let tm = TransactionManager::new();
+        let tm = std::sync::Arc::new(TransactionManager::new());
         let txn = tm.begin();
 
         tm.commit(txn.txn_id);
@@ -132,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_abort_transaction() {
-        let tm = TransactionManager::new();
+        let tm = std::sync::Arc::new(TransactionManager::new());
         let txn = tm.begin();
 
         tm.abort(txn.txn_id);
@@ -144,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_empty_active() {
-        let tm = TransactionManager::new();
+        let tm = std::sync::Arc::new(TransactionManager::new());
         let snap = tm.get_snapshot();
 
         // When empty, xmin should equal xmax
@@ -154,7 +184,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_with_multiple_active() {
-        let tm = TransactionManager::new();
+        let tm = std::sync::Arc::new(TransactionManager::new());
         let txn1 = tm.begin();
         let txn2 = tm.begin();
 
@@ -169,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_with_commits_in_middle() {
-        let tm = TransactionManager::new();
+        let tm = std::sync::Arc::new(TransactionManager::new());
         let txn1 = tm.begin();
         let txn2 = tm.begin();
         let txn3 = tm.begin();

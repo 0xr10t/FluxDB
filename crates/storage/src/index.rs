@@ -19,7 +19,7 @@ use crate::page::{
     LeafPageAccessor, LeafPageBuilder, LeafPageMutator, PageId,
 };
 
-use db_core::transaction::{Snapshot, Transaction, is_visible};
+use db_core::transaction::Transaction;
 // ── Error type ────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -122,7 +122,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         }
 
         let acc = LeafPageAccessor::<K, V>::new(&page[..]);
-        match self.find_visible_slot(&acc, key, &txn.snapshot) {
+        match self.find_visible_slot(&acc, key, txn) {
             Some(slot) => {
                 let val = acc.get_value(slot);
                 Ok(Some(V::as_bytes(&val).as_ref().to_vec()))
@@ -279,7 +279,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         // Find visible version.
         let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
         let visible_slot = self
-            .find_visible_slot(&acc, key, &txn.snapshot)
+            .find_visible_slot(&acc, key, txn)
             .ok_or(IndexError::KeyNotFound)?;
 
         // Conflict check: has another in-progress txn already set xmax?
@@ -364,7 +364,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         // Find visible version under same exclusive latch.
         let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
         let visible_slot = self
-            .find_visible_slot(&acc, key, &txn.snapshot)
+            .find_visible_slot(&acc, key, txn)
             .ok_or(IndexError::KeyNotFound)?;
 
         // Conflict check.
@@ -430,7 +430,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             slot: start_slot,
             end_key,
             end_inclusive,
-            snapshot: txn.snapshot.clone(),
+            txn: txn.clone(),
             _key: PhantomData,
             _val: PhantomData,
         }
@@ -447,7 +447,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         &self,
         acc: &LeafPageAccessor<'_, K, V>,
         key: &K::SelfType<'_>,
-        snap: &Snapshot,
+        txn: &Transaction,
     ) -> Option<usize> {
         let key_bytes = K::as_bytes(key);
         let key_ref = key_bytes.as_ref();
@@ -476,7 +476,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             if K::compare(rec_key.as_ref(), key_ref) != Ordering::Equal {
                 break;
             }
-            if is_visible(acc.get_xmin(i), acc.get_xmax(i), snap) {
+            if txn.is_visible(acc.get_xmin(i), acc.get_xmax(i)) {
                 return Some(i);
             }
             i += 1;
@@ -523,19 +523,19 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
             // If xmin is in-progress (uncommitted insert by another txn),
             // that txn might commit → would create a duplicate.
-            if xmin != txn.txn_id && txn.snapshot.is_in_progress(xmin) {
+            if xmin != txn.txn_id && txn.is_in_progress(xmin) {
                 // TODO! wait-for-commit: block until xmin txn commits/aborts
                 return Err(IndexError::WriteConflict);
             }
 
             // If the record is visible to us, it's a duplicate.
-            if is_visible(xmin, xmax, &txn.snapshot) {
+            if txn.is_visible(xmin, xmax) {
                 return Err(IndexError::DuplicateKey);
             }
 
             // If xmax is in-progress (another txn is deleting this version),
             // that deletion might abort → the record would reappear as live.
-            if xmax != 0 && xmax != txn.txn_id && txn.snapshot.is_in_progress(xmax) {
+            if xmax != 0 && xmax != txn.txn_id && txn.is_in_progress(xmax) {
                 // TODO! wait-for-commit: block until xmax txn commits/aborts
                 return Err(IndexError::WriteConflict);
             }
@@ -553,7 +553,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         if rec_xmax == txn.txn_id {
             return Ok(()); // we already modified it (re-entrant)
         }
-        if txn.snapshot.is_in_progress(rec_xmax) {
+        if txn.is_in_progress(rec_xmax) {
             // Another active txn claimed this version → first writer wins → we lose.
             return Err(IndexError::WriteConflict);
         }
@@ -920,7 +920,7 @@ pub struct RangeScan<'a, K: Key, V: Value> {
     slot: usize,
     end_key: Option<Vec<u8>>,
     end_inclusive: bool,
-    snapshot: Snapshot,
+    txn: Transaction,
     _key: PhantomData<K>,
     _val: PhantomData<V>,
 }
@@ -943,7 +943,7 @@ impl<'a, K: Key, V: Value> Iterator for RangeScan<'a, K, V> {
                 let xmax = acc.get_xmax(self.slot);
 
                 // Skip records not visible to our snapshot.
-                if !is_visible(xmin, xmax, &self.snapshot) {
+                if !self.txn.is_visible(xmin, xmax) {
                     self.slot += 1;
                     continue;
                 }
@@ -1000,10 +1000,20 @@ mod tests {
     }
 
     fn auto() -> Transaction {
+        static TM_LOCK: std::sync::OnceLock<
+            std::sync::Arc<db_core::transaction_manager::TransactionManager>,
+        > = std::sync::OnceLock::new();
+        let tm = TM_LOCK
+            .get_or_init(|| {
+                std::sync::Arc::new(db_core::transaction_manager::TransactionManager::new())
+            })
+            .clone();
+
         static TEST_TXN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Transaction {
             txn_id: TEST_TXN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            snapshot: Snapshot::latest(),
+            snapshot: db_core::transaction::Snapshot::latest(),
+            tm,
         }
     }
 
@@ -1249,25 +1259,21 @@ mod tests {
 
     #[test]
     fn write_conflict_on_concurrent_delete() {
+        let tm = std::sync::Arc::new(db_core::transaction_manager::TransactionManager::new());
         let idx = make_index();
-        idx.insert(&(&b"k"[..]), &(&b"v"[..]), &auto()).unwrap();
 
-        // Simulate: txn 10 deletes the key (xmax = 10).
-        let txn10 = Transaction {
-            txn_id: 10,
-            snapshot: Snapshot::latest(),
-        };
+        // 1. Insert a key.
+        let insert_txn = tm.begin();
+        idx.insert(&(&b"k"[..]), &(&b"v"[..]), &insert_txn).unwrap();
+        tm.commit(insert_txn.txn_id);
+
+        // 2. Start txn10 and delete the key.
+        let txn10 = tm.begin();
         idx.delete(&(&b"k"[..]), &txn10).unwrap();
 
-        // txn 20 tries to delete the same key. Txn 10 is in txn20's active list.
-        let txn20 = Transaction {
-            txn_id: 20,
-            snapshot: Snapshot {
-                xmin: 1,
-                xmax: 30,
-                active: vec![10],
-            },
-        };
+        // 3. Start txn20. It should see txn10 as active.
+        let txn20 = tm.begin();
+
         match idx.delete(&(&b"k"[..]), &txn20) {
             Err(IndexError::WriteConflict) => {}
             other => panic!("expected WriteConflict, got {:?}", other),

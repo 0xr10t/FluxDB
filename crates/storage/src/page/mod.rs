@@ -17,7 +17,7 @@ use thiserror::Error;
 // ── Type aliases ──────────────────────────────────────────────────────────────
 
 pub type PageId = u64;
-pub type Lsn    = u64;
+pub type Lsn = u64;
 pub type SlotId = u16;
 
 // ── Page-type marker bytes ────────────────────────────────────────────────────
@@ -34,10 +34,10 @@ pub const PAGE_SIZE: usize = 4096;
 
 // ── Shared header offsets (present in both page types) ───────────────────────
 
-pub(super) const OFF_PAGE_TYPE: usize = 0;  // u8
+pub(super) const OFF_PAGE_TYPE: usize = 0; // u8
 // Byte 1 is reserved (was `flags`, never used).
-pub(super) const OFF_PAGE_ID:   usize = 8;  // u64
-pub(super) const OFF_LSN:       usize = 16; // u64
+pub(super) const OFF_PAGE_ID: usize = 8; // u64
+pub(super) const OFF_LSN: usize = 16; // u64
 
 // ── Shared error type ─────────────────────────────────────────────────────────
 

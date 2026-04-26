@@ -4,5 +4,4 @@ pub const INVALID_FRAME_ID: u64 = u64::MAX;
 pub const NUM_SHARDS: usize = 8;
 pub const SHARD_MASK: u64 = (NUM_SHARDS - 1) as u64;
 
-
 pub const MAX_KEY_SIZE: usize = 512;

@@ -11,28 +11,33 @@ use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, Mutex};
 
-use common::{Key, Value, MAX_KEY_SIZE};
+use common::{Key, MAX_KEY_SIZE, Value};
 
 use crate::buffer_pool::{BufferPoolError, BufferPoolManager, PageReadGuard, PageWriteGuard};
 use crate::page::{
-    InternalPageAccessor, InternalPageBuilder, InternalPageMutator,
-    LeafPageAccessor, LeafPageBuilder, LeafPageMutator,
-    PageId, INTERNAL, LEAF,
+    INTERNAL, InternalPageAccessor, InternalPageBuilder, InternalPageMutator, LEAF,
+    LeafPageAccessor, LeafPageBuilder, LeafPageMutator, PageId,
 };
 
-use db_core::transaction::{Transaction, Snapshot, is_visible}; 
+use db_core::transaction::{Snapshot, Transaction, is_visible};
 // ── Error type ────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub enum IndexError {
     KeyNotFound,
-    KeyTooLarge { size: usize, max: usize },
+    KeyTooLarge {
+        size: usize,
+        max: usize,
+    },
     /// Insert attempted on a key that already has a visible version.
     DuplicateKey,
     /// Another in-progress transaction has already modified this record.
     /// First-writer-wins: the current transaction should abort.
     WriteConflict,
-    UnexpectedPageType { expected: u8, found: u8 },
+    UnexpectedPageType {
+        expected: u8,
+        found: u8,
+    },
     BufferPool(BufferPoolError),
 }
 
@@ -70,11 +75,15 @@ pub struct BTreeIndex<K: Key, V: Value> {
 }
 
 impl<K: Key, V: Value> BTreeIndex<K, V> {
-
     // ── Constructors ──────────────────────────────────────────────────────────
 
     pub fn open(pool: Arc<BufferPoolManager>, root_id: PageId) -> Self {
-        Self { pool, root: Mutex::new(root_id), _key: PhantomData, _val: PhantomData }
+        Self {
+            pool,
+            root: Mutex::new(root_id),
+            _key: PhantomData,
+            _val: PhantomData,
+        }
     }
 
     pub fn create(pool: Arc<BufferPoolManager>) -> Result<(Self, PageId)> {
@@ -134,7 +143,10 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         let key_len = key_bytes.as_ref().len();
 
         if key_len > MAX_KEY_SIZE {
-            return Err(IndexError::KeyTooLarge { size: key_len, max: MAX_KEY_SIZE });
+            return Err(IndexError::KeyTooLarge {
+                size: key_len,
+                max: MAX_KEY_SIZE,
+            });
         }
 
         let root_pid = *self.root.lock().unwrap();
@@ -160,8 +172,16 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     drop(page);
                     pid = child_pid;
                 }
-                LEAF => { drop(page); break pid; }
-                found => return Err(IndexError::UnexpectedPageType { expected: LEAF, found }),
+                LEAF => {
+                    drop(page);
+                    break pid;
+                }
+                found => {
+                    return Err(IndexError::UnexpectedPageType {
+                        expected: LEAF,
+                        found,
+                    });
+                }
             }
         };
 
@@ -190,14 +210,12 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         }
 
         // Insert new record.
-        let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
-            .insert(slot, key, value);
+        let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(slot, key, value);
 
         match result {
             Ok(()) => {
                 // Set xmin to the inserting transaction.
-                LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
-                    .set_xmin(slot, txn.txn_id);
+                LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
                 return Ok(());
             }
             Err(_) => {
@@ -230,8 +248,16 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     drop(page);
                     pid = child_pid;
                 }
-                LEAF => { drop(page); break pid; }
-                found => return Err(IndexError::UnexpectedPageType { expected: LEAF, found }),
+                LEAF => {
+                    drop(page);
+                    break pid;
+                }
+                found => {
+                    return Err(IndexError::UnexpectedPageType {
+                        expected: LEAF,
+                        found,
+                    });
+                }
             }
         };
 
@@ -252,7 +278,8 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
         // Find visible version.
         let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-        let visible_slot = self.find_visible_slot(&acc, key, &txn.snapshot)
+        let visible_slot = self
+            .find_visible_slot(&acc, key, &txn.snapshot)
             .ok_or(IndexError::KeyNotFound)?;
 
         // Conflict check: has another in-progress txn already set xmax?
@@ -260,8 +287,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         self.check_write_conflict(rec_xmax, txn)?;
 
         // Set xmax to mark this version as deleted by our transaction.
-        LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
-            .set_xmax(visible_slot, txn.txn_id);
+        LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
 
         Ok(())
     }
@@ -278,7 +304,10 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         let key_len = key_bytes.as_ref().len();
 
         if key_len > MAX_KEY_SIZE {
-            return Err(IndexError::KeyTooLarge { size: key_len, max: MAX_KEY_SIZE });
+            return Err(IndexError::KeyTooLarge {
+                size: key_len,
+                max: MAX_KEY_SIZE,
+            });
         }
 
         let root_pid = *self.root.lock().unwrap();
@@ -304,8 +333,16 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     drop(page);
                     pid = child_pid;
                 }
-                LEAF => { drop(page); break pid; }
-                found => return Err(IndexError::UnexpectedPageType { expected: LEAF, found }),
+                LEAF => {
+                    drop(page);
+                    break pid;
+                }
+                found => {
+                    return Err(IndexError::UnexpectedPageType {
+                        expected: LEAF,
+                        found,
+                    });
+                }
             }
         };
 
@@ -326,7 +363,8 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
         // Find visible version under same exclusive latch.
         let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-        let visible_slot = self.find_visible_slot(&acc, key, &txn.snapshot)
+        let visible_slot = self
+            .find_visible_slot(&acc, key, &txn.snapshot)
             .ok_or(IndexError::KeyNotFound)?;
 
         // Conflict check.
@@ -334,18 +372,15 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         self.check_write_conflict(rec_xmax, txn)?;
 
         // ── ATOMIC: set xmax on old + insert new (same latch) ────────────
-        LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
-            .set_xmax(visible_slot, txn.txn_id);
+        LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
 
         // Find insert position for the new version.
         let (slot, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
-        let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
-            .insert(slot, key, value);
+        let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(slot, key, value);
 
         match result {
             Ok(()) => {
-                LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
-                    .set_xmin(slot, txn.txn_id);
+                LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
                 return Ok(());
             }
             Err(_) => {
@@ -376,7 +411,9 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 (Some(leaf_pid), if exact { slot + 1 } else { slot })
             }
             Bound::Unbounded => {
-                let leaf_pid = self.find_leftmost_leaf(root_pid).expect("find_leftmost failed");
+                let leaf_pid = self
+                    .find_leftmost_leaf(root_pid)
+                    .expect("find_leftmost failed");
                 (Some(leaf_pid), 0)
             }
         };
@@ -384,7 +421,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         let (end_key, end_inclusive) = match range.end_bound() {
             Bound::Included(k) => (Some(K::as_bytes(k).as_ref().to_vec()), true),
             Bound::Excluded(k) => (Some(K::as_bytes(k).as_ref().to_vec()), false),
-            Bound::Unbounded   => (None, false),
+            Bound::Unbounded => (None, false),
         };
 
         RangeScan {
@@ -415,7 +452,9 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         let key_bytes = K::as_bytes(key);
         let key_ref = key_bytes.as_ref();
         let (start, found) = acc.position(key);
-        if !found { return None; }
+        if !found {
+            return None;
+        }
 
         // Scan backward to find the first duplicate.
         let mut first = start;
@@ -466,7 +505,9 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         while i > 0 {
             let prev_key_val = acc.get_key(i - 1);
             let prev_key = K::as_bytes(&prev_key_val);
-            if K::compare(prev_key.as_ref(), key_ref) != Ordering::Equal { break; }
+            if K::compare(prev_key.as_ref(), key_ref) != Ordering::Equal {
+                break;
+            }
             i -= 1;
         }
 
@@ -528,15 +569,15 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         let mut parent_latch: Option<PageReadGuard<'_>> = None;
 
         loop {
-            // acquired read guard on fetched page 
+            // acquired read guard on fetched page
             let page = self.pool.fetch_page(pid)?;
-            // dropped parent latch 
+            // dropped parent latch
             drop(parent_latch.take());
 
             match page[0] {
                 INTERNAL => {
                     let acc = InternalPageAccessor::<K>::new(&page[..]);
-                    // rightlink correction in case split happened before we acquired lock on child 
+                    // rightlink correction in case split happened before we acquired lock on child
                     if let Some(hk) = acc.high_key_bytes() {
                         let key_b = K::as_bytes(key);
                         if K::compare(key_b.as_ref(), hk) != Ordering::Less {
@@ -550,10 +591,16 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     parent_latch = Some(page);
                     pid = child_pid;
                 }
-                LEAF => { drop(page); return Ok(pid); }
+                LEAF => {
+                    drop(page);
+                    return Ok(pid);
+                }
                 found => {
                     drop(page);
-                    return Err(IndexError::UnexpectedPageType { expected: LEAF, found });
+                    return Err(IndexError::UnexpectedPageType {
+                        expected: LEAF,
+                        found,
+                    });
                 }
             }
         }
@@ -569,10 +616,16 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     drop(page);
                     pid = child;
                 }
-                LEAF => { drop(page); return Ok(pid); }
+                LEAF => {
+                    drop(page);
+                    return Ok(pid);
+                }
                 found => {
                     drop(page);
-                    return Err(IndexError::UnexpectedPageType { expected: LEAF, found });
+                    return Err(IndexError::UnexpectedPageType {
+                        expected: LEAF,
+                        found,
+                    });
                 }
             }
         }
@@ -595,19 +648,19 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         let leaf_pid_actual = leaf_guard.page_id;
         let split = self.split_leaf_ly(&mut leaf_guard)?;
 
-        let target_pid = if K::compare(key_bytes.as_ref(), split.separator_key.as_slice()) != Ordering::Less {
-            split.new_page_id
-        } else {
-            leaf_pid_actual
-        };
+        let target_pid =
+            if K::compare(key_bytes.as_ref(), split.separator_key.as_slice()) != Ordering::Less {
+                split.new_page_id
+            } else {
+                leaf_pid_actual
+            };
 
         if target_pid == leaf_pid_actual {
             let (s, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
                 .insert(s, key, value)
                 .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
-            LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
-                .set_xmin(s, txn_id);
+            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(s, txn_id);
         } else {
             drop(leaf_guard);
             let mut right = self.pool.fetch_page_mut(target_pid)?;
@@ -615,8 +668,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             LeafPageMutator::<K, V>::new(&mut right[..])
                 .insert(s, key, value)
                 .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
-            LeafPageMutator::<K, V>::new(&mut right[..])
-                .set_xmin(s, txn_id);
+            LeafPageMutator::<K, V>::new(&mut right[..]).set_xmin(s, txn_id);
         }
 
         self.insert_separator_via_stack(stack, split.separator_key, split.new_page_id)
@@ -692,8 +744,10 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             builder.set_prev_page(Some(leaf_pid));
             for i in mid..n {
                 builder.push_with_mvcc(
-                    &acc.get_key(i), &acc.get_value(i),
-                    acc.get_xmin(i), acc.get_xmax(i),
+                    &acc.get_key(i),
+                    &acc.get_value(i),
+                    acc.get_xmin(i),
+                    acc.get_xmax(i),
                 );
             }
             builder.finish();
@@ -714,15 +768,16 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             builder.set_rightlink(Some(right_pid));
             builder.set_prev_page(prev);
             for (k, v, xmin, xmax) in &left_entries {
-                builder.push_with_mvcc(
-                    &K::from_bytes(k), &V::from_bytes(v), *xmin, *xmax,
-                );
+                builder.push_with_mvcc(&K::from_bytes(k), &V::from_bytes(v), *xmin, *xmax);
             }
             let mut m = builder.finish();
             m.set_lsn(lsn);
         }
 
-        Ok(SplitResult { separator_key, new_page_id: right_pid })
+        Ok(SplitResult {
+            separator_key,
+            new_page_id: right_pid,
+        })
     }
 
     fn insert_separator_via_stack(
@@ -737,7 +792,8 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 let mut new_root_guard = self.pool.new_page()?;
                 let new_root_pid = new_root_guard.page_id;
 
-                let mut builder = InternalPageBuilder::<K>::new(new_root_pid, &mut new_root_guard[..]);
+                let mut builder =
+                    InternalPageBuilder::<K>::new(new_root_pid, &mut new_root_guard[..]);
                 builder.push_first_child(old_root_pid);
                 builder.push_key_and_right_child(&K::from_bytes(&sep_key), right_pid);
                 builder.finish();
@@ -774,9 +830,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 return Ok(());
             }
 
-            let parent_split = self.split_internal_ly(
-                &mut parent_guard, &sep_key, right_pid,
-            )?;
+            let parent_split = self.split_internal_ly(&mut parent_guard, &sep_key, right_pid)?;
             drop(parent_guard);
 
             sep_key = parent_split.separator_key;
@@ -851,7 +905,10 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             m.set_lsn(lsn);
         }
 
-        Ok(SplitResult { separator_key: push_up_key, new_page_id: right_pid })
+        Ok(SplitResult {
+            separator_key: push_up_key,
+            new_page_id: right_pid,
+        })
     }
 }
 
@@ -898,8 +955,11 @@ impl<'a, K: Key, V: Value> Iterator for RangeScan<'a, K, V> {
                     None => true,
                     Some(end) => {
                         let cmp = K::compare(&k, end);
-                        if self.end_inclusive { cmp != Ordering::Greater }
-                        else { cmp == Ordering::Less }
+                        if self.end_inclusive {
+                            cmp != Ordering::Greater
+                        } else {
+                            cmp == Ordering::Less
+                        }
                     }
                 };
 
@@ -939,7 +999,13 @@ mod tests {
         index
     }
 
-    fn auto() -> Transaction { Transaction::auto() }
+    fn auto() -> Transaction {
+        static TEST_TXN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Transaction {
+            txn_id: TEST_TXN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            snapshot: Snapshot::latest(),
+        }
+    }
 
     fn leak_bytes(b: &[u8]) -> &'static [u8] {
         Box::leak(b.to_vec().into_boxed_slice())
@@ -956,7 +1022,8 @@ mod tests {
     #[test]
     fn insert_and_get_single_entry() {
         let idx = make_index();
-        idx.insert(&(&b"key"[..]), &(&b"value"[..]), &auto()).unwrap();
+        idx.insert(&(&b"key"[..]), &(&b"value"[..]), &auto())
+            .unwrap();
         let got = idx.get(&(&b"key"[..]), &auto()).unwrap().unwrap();
         assert_eq!(got, b"value");
     }
@@ -1036,7 +1103,9 @@ mod tests {
         for i in 0u64..200 {
             let k = i.to_be_bytes();
             let expected = (i * 10).to_be_bytes();
-            let got = idx.get(&(k.as_ref()), &auto()).unwrap()
+            let got = idx
+                .get(&(k.as_ref()), &auto())
+                .unwrap()
                 .unwrap_or_else(|| panic!("key {} missing", i));
             assert_eq!(got, expected.as_ref());
         }
@@ -1053,7 +1122,9 @@ mod tests {
         for i in 0u32..2000 {
             let k = i.to_be_bytes();
             let expected = (i + 1).to_be_bytes();
-            let got = idx.get(&(k.as_ref()), &auto()).unwrap()
+            let got = idx
+                .get(&(k.as_ref()), &auto())
+                .unwrap()
                 .unwrap_or_else(|| panic!("key {} missing", i));
             assert_eq!(got, expected.as_ref());
         }
@@ -1068,7 +1139,9 @@ mod tests {
         }
         for i in 0u32..500 {
             let k = i.to_be_bytes();
-            let got = idx.get(&(k.as_ref()), &auto()).unwrap()
+            let got = idx
+                .get(&(k.as_ref()), &auto())
+                .unwrap()
                 .unwrap_or_else(|| panic!("key {} missing", i));
             assert_eq!(got, k.as_ref());
         }
@@ -1089,7 +1162,8 @@ mod tests {
         }
         for i in (0u32..200).filter(|x| x % 2 == 1) {
             let k = i.to_be_bytes();
-            idx.get(&(k.as_ref()), &auto()).unwrap()
+            idx.get(&(k.as_ref()), &auto())
+                .unwrap()
                 .unwrap_or_else(|| panic!("odd key {} missing", i));
         }
         for i in (0u32..200).filter(|x| x % 2 == 0) {
@@ -1116,7 +1190,9 @@ mod tests {
         for i in 0..n {
             let k = i.to_be_bytes();
             let expected = (i + 1000).to_be_bytes();
-            let got = idx.get(&(k.as_ref()), &auto()).unwrap()
+            let got = idx
+                .get(&(k.as_ref()), &auto())
+                .unwrap()
                 .unwrap_or_else(|| panic!("key {} missing after update", i));
             assert_eq!(got, expected.as_ref());
         }
@@ -1131,7 +1207,8 @@ mod tests {
             let k = i.to_be_bytes();
             idx.insert(&(k.as_ref()), &(k.as_ref()), &auto()).unwrap();
         }
-        let results: Vec<_> = idx.range::<std::ops::RangeFull>(.., &auto())
+        let results: Vec<_> = idx
+            .range::<std::ops::RangeFull>(.., &auto())
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(results.len(), 100);
@@ -1148,7 +1225,8 @@ mod tests {
             let k = i.to_be_bytes();
             idx.delete(&(k.as_ref()), &auto()).unwrap();
         }
-        let results: Vec<_> = idx.range::<std::ops::RangeFull>(.., &auto())
+        let results: Vec<_> = idx
+            .range::<std::ops::RangeFull>(.., &auto())
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(results.len(), 7);
@@ -1163,8 +1241,7 @@ mod tests {
         }
         let start: &'static [u8] = leak_bytes(&10u32.to_be_bytes());
         let end: &'static [u8] = leak_bytes(&20u32.to_be_bytes());
-        let results: Vec<_> = idx.range(start..end, &auto())
-            .map(|r| r.unwrap()).collect();
+        let results: Vec<_> = idx.range(start..end, &auto()).map(|r| r.unwrap()).collect();
         assert_eq!(results.len(), 10);
     }
 
@@ -1176,13 +1253,20 @@ mod tests {
         idx.insert(&(&b"k"[..]), &(&b"v"[..]), &auto()).unwrap();
 
         // Simulate: txn 10 deletes the key (xmax = 10).
-        let txn10 = Transaction { txn_id: 10, snapshot: Snapshot::latest() };
+        let txn10 = Transaction {
+            txn_id: 10,
+            snapshot: Snapshot::latest(),
+        };
         idx.delete(&(&b"k"[..]), &txn10).unwrap();
 
         // txn 20 tries to delete the same key. Txn 10 is in txn20's active list.
         let txn20 = Transaction {
             txn_id: 20,
-            snapshot: Snapshot { xmin: 1, xmax: 30, active: vec![10] },
+            snapshot: Snapshot {
+                xmin: 1,
+                xmax: 30,
+                active: vec![10],
+            },
         };
         match idx.delete(&(&b"k"[..]), &txn20) {
             Err(IndexError::WriteConflict) => {}

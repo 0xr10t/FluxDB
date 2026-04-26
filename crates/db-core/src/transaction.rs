@@ -37,20 +37,6 @@ pub struct Transaction {
     pub snapshot: Snapshot,
 }
 
-impl Transaction {
-    /// Creates a transaction that sees all committed data.
-    ///
-    /// Uses `txn_id = 1` (not 0, because xmax=0 means "live") and
-    /// `Snapshot::latest()`. Suitable for single-threaded use or when
-    /// no transaction manager is wired.
-    pub fn auto() -> Self {
-        Self {
-            txn_id: TXN_ID.fetch_add(1, Relaxed),
-            snapshot: Snapshot::latest(),
-        }
-    }
-}
-
 /// A point-in-time view of transaction state.
 ///
 /// Captures which transactions were in-progress when the snapshot was taken.
@@ -182,7 +168,11 @@ mod tests {
     use super::*;
 
     fn snap(xmin: u64, xmax: u64, active: &[u64]) -> Snapshot {
-        Snapshot { xmin, xmax, active: active.to_vec() }
+        Snapshot {
+            xmin,
+            xmax,
+            active: active.to_vec(),
+        }
     }
 
     // ── Snapshot::latest() ────────────────────────────────────────────────
@@ -297,21 +287,5 @@ mod tests {
     fn is_in_progress_committed() {
         let s = snap(10, 20, &[]);
         assert!(!s.is_in_progress(5)); // < xmin → finished
-    }
-
-    // ── Transaction::auto() ──────────────────────────────────────────────
-
-    #[test]
-    fn auto_txn_id_is_nonzero() {
-        let txn = Transaction::auto();
-        assert_ne!(txn.txn_id, 0); // must be non-zero so xmax=txn_id means "dead"
-    }
-
-    #[test]
-    fn auto_snapshot_is_latest() {
-        let txn = Transaction::auto();
-        assert_eq!(txn.snapshot.xmin, u64::MAX);
-        assert_eq!(txn.snapshot.xmax, u64::MAX);
-        assert!(txn.snapshot.active.is_empty());
     }
 }

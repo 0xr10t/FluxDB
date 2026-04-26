@@ -50,39 +50,37 @@
 //! └──────────────────────────────────────────────────────────┘
 //! ```
 
+use common::{Key, Value};
 use std::cmp::Ordering;
 use std::marker::PhantomData;
-use common::{Key, Value};
 
 use super::{
-    read_u16, read_u64, read_u8,
-    write_u8, write_u16, write_u32, write_u64,
-    Lsn, PageError, PageId, PAGE_SIZE,
-    OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, LEAF,
+    LEAF, Lsn, OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, PAGE_SIZE, PageError, PageId, read_u8,
+    read_u16, read_u64, write_u8, write_u16, write_u32, write_u64,
 };
 
 // ── Leaf-page-specific header offsets ────────────────────────────────────────
 
-const OFF_LEAF_SLOT_COUNT:  usize = 2;   // u16
-const OFF_LEAF_FREE_START:  usize = 4;   // u16
-const OFF_LEAF_FREE_END:    usize = 6;   // u16
+const OFF_LEAF_SLOT_COUNT: usize = 2; // u16
+const OFF_LEAF_FREE_START: usize = 4; // u16
+const OFF_LEAF_FREE_END: usize = 6; // u16
 // OFF_PAGE_ID at 8, OFF_LSN at 16 (shared)
-const OFF_LEAF_PREV:        usize = 24;  // u64
-const OFF_LEAF_RIGHTLINK:   usize = 32;  // u64 (was next_page)
+const OFF_LEAF_PREV: usize = 24; // u64
+const OFF_LEAF_RIGHTLINK: usize = 32; // u64 (was next_page)
 const OFF_LEAF_HIGH_KEY_LEN: usize = 40; // u16
 // bytes 42..48: padding
-const LEAF_HEADER_SIZE:     usize = 48;
+const LEAF_HEADER_SIZE: usize = 48;
 
 const SLOT_SIZE: usize = 4; // u16 offset + u16 rec_size
 
 // ── Record layout offsets (relative to record base) ──────────────────────────
 
-const REC_OFF_KEY_LEN:  usize = 0;  // u16
-const REC_OFF_VAL_LEN:  usize = 2;  // u16
+const REC_OFF_KEY_LEN: usize = 0; // u16
+const REC_OFF_VAL_LEN: usize = 2; // u16
 // bytes 4..8: reserved (u32, always 0)
-const REC_OFF_XMIN:     usize = 8;  // u64 — creating transaction ID
-const REC_OFF_XMAX:     usize = 16; // u64 — deleting/replacing transaction ID (0 = live)
-const REC_HEADER_SIZE:  usize = 24; // 2+2+4+8+8 = 24 bytes
+const REC_OFF_XMIN: usize = 8; // u64 — creating transaction ID
+const REC_OFF_XMAX: usize = 16; // u64 — deleting/replacing transaction ID (0 = live)
+const REC_HEADER_SIZE: usize = 24; // 2+2+4+8+8 = 24 bytes
 
 // ── Layout helpers ───────────────────────────────────────────────────────────
 
@@ -137,10 +135,15 @@ impl<'a, K: Key, V: Value> LeafPageAccessor<'a, K, V> {
     /// Panics if the page-type byte does not equal [`LEAF`].
     pub fn new(data: &'a [u8]) -> Self {
         assert_eq!(
-            read_u8(data, OFF_PAGE_TYPE), LEAF,
+            read_u8(data, OFF_PAGE_TYPE),
+            LEAF,
             "LeafPageAccessor: page type byte is not LEAF"
         );
-        Self { data, _key: PhantomData, _val: PhantomData }
+        Self {
+            data,
+            _key: PhantomData,
+            _val: PhantomData,
+        }
     }
 
     // ── Page-level metadata ───────────────────────────────────────────────────
@@ -186,7 +189,9 @@ impl<'a, K: Key, V: Value> LeafPageAccessor<'a, K, V> {
     /// Raw high key bytes, or `None` if this is the rightmost leaf (+infinity).
     pub fn high_key_bytes(&self) -> Option<&'a [u8]> {
         let len = self.high_key_len() as usize;
-        if len == 0 { return None; }
+        if len == 0 {
+            return None;
+        }
         Some(&self.data[LEAF_HEADER_SIZE..LEAF_HEADER_SIZE + len])
     }
 
@@ -220,7 +225,9 @@ impl<'a, K: Key, V: Value> LeafPageAccessor<'a, K, V> {
     /// should donate to or merge with a sibling.
     pub fn is_underfull(&self) -> bool {
         let n = self.num_pairs() as usize;
-        if n == 0 { return true; }
+        if n == 0 {
+            return true;
+        }
         let hkl = self.high_key_len() as usize;
         let mut live = 0usize;
         for i in 0..n {
@@ -247,9 +254,9 @@ impl<'a, K: Key, V: Value> LeafPageAccessor<'a, K, V> {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             match K::compare(self.key_bytes_at(mid), query_bytes) {
-                Ordering::Less    => lo = mid + 1,
+                Ordering::Less => lo = mid + 1,
                 Ordering::Greater => hi = mid,
-                Ordering::Equal   => return (mid, true),
+                Ordering::Equal => return (mid, true),
             }
         }
         (lo, false)
@@ -312,16 +319,16 @@ impl<'a, K: Key, V: Value> LeafPageAccessor<'a, K, V> {
 
     fn key_bytes_at(&self, i: usize) -> &'a [u8] {
         let rec_base = self.slot_rec_base(i);
-        let key_len  = read_u16(self.data, rec_base + REC_OFF_KEY_LEN) as usize;
-        let key_off  = rec_key_offset(rec_base);
+        let key_len = read_u16(self.data, rec_base + REC_OFF_KEY_LEN) as usize;
+        let key_off = rec_key_offset(rec_base);
         &self.data[key_off..key_off + key_len]
     }
 
     fn value_bytes_at(&self, i: usize) -> &'a [u8] {
         let rec_base = self.slot_rec_base(i);
-        let key_len  = read_u16(self.data, rec_base + REC_OFF_KEY_LEN) as usize;
-        let val_len  = read_u16(self.data, rec_base + REC_OFF_VAL_LEN) as usize;
-        let val_off  = rec_val_offset(rec_base, key_len);
+        let key_len = read_u16(self.data, rec_base + REC_OFF_KEY_LEN) as usize;
+        let val_len = read_u16(self.data, rec_base + REC_OFF_VAL_LEN) as usize;
+        let val_off = rec_val_offset(rec_base, key_len);
         &self.data[val_off..val_off + val_len]
     }
 }
@@ -340,10 +347,15 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
     /// Panics if the page-type byte does not equal [`LEAF`].
     pub fn new(data: &'a mut [u8]) -> Self {
         assert_eq!(
-            read_u8(data, OFF_PAGE_TYPE), LEAF,
+            read_u8(data, OFF_PAGE_TYPE),
+            LEAF,
             "LeafPageMutator: page type byte is not LEAF"
         );
-        Self { data, _key: PhantomData, _val: PhantomData }
+        Self {
+            data,
+            _key: PhantomData,
+            _val: PhantomData,
+        }
     }
 
     // ── Header setters ────────────────────────────────────────────────────────
@@ -402,25 +414,25 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
     /// Insert a new `(key, value)` pair at slot position `pos`.
     pub fn insert(
         &mut self,
-        pos:   usize,
-        key:   &K::SelfType<'_>,
+        pos: usize,
+        key: &K::SelfType<'_>,
         value: &V::SelfType<'_>,
     ) -> Result<(), PageError> {
         let key_bytes = K::as_bytes(key);
         let key_bytes = key_bytes.as_ref();
         let val_bytes = V::as_bytes(value);
         let val_bytes = val_bytes.as_ref();
-        let key_len  = key_bytes.len();
-        let val_len  = val_bytes.len();
+        let key_len = key_bytes.len();
+        let val_len = val_bytes.len();
         let rec_size = rec_total_size(key_len, val_len);
 
-        let free_end   = read_u16(self.data, OFF_LEAF_FREE_END)   as usize;
+        let free_end = read_u16(self.data, OFF_LEAF_FREE_END) as usize;
         let free_start = read_u16(self.data, OFF_LEAF_FREE_START) as usize;
-        let free       = free_end - free_start;
+        let free = free_end - free_start;
 
         if free < SLOT_SIZE + rec_size {
             return Err(PageError::InsufficientSpace {
-                needed:    SLOT_SIZE + rec_size,
+                needed: SLOT_SIZE + rec_size,
                 available: free,
             });
         }
@@ -442,7 +454,7 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
 
         // Shift slot directory: [pos..n] → [pos+1..n+1].
         let hkl = read_u16(self.data, OFF_LEAF_HIGH_KEY_LEN) as usize;
-        let n   = read_u16(self.data, OFF_LEAF_SLOT_COUNT) as usize;
+        let n = read_u16(self.data, OFF_LEAF_SLOT_COUNT) as usize;
         let src = slot_offset_at(hkl, pos);
         let len = (n - pos) * SLOT_SIZE;
         if len > 0 {
@@ -451,13 +463,17 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
 
         // Write the new slot entry.
         let slot_off = slot_offset_at(hkl, pos);
-        write_u16(self.data, slot_off,     rec_base as u16);
+        write_u16(self.data, slot_off, rec_base as u16);
         write_u16(self.data, slot_off + 2, rec_size as u16);
 
         // Update header.
-        write_u16(self.data, OFF_LEAF_SLOT_COUNT,  (n + 1) as u16);
-        write_u16(self.data, OFF_LEAF_FREE_START,  (free_start + SLOT_SIZE) as u16);
-        write_u16(self.data, OFF_LEAF_FREE_END,    rec_base as u16);
+        write_u16(self.data, OFF_LEAF_SLOT_COUNT, (n + 1) as u16);
+        write_u16(
+            self.data,
+            OFF_LEAF_FREE_START,
+            (free_start + SLOT_SIZE) as u16,
+        );
+        write_u16(self.data, OFF_LEAF_FREE_END, rec_base as u16);
 
         Ok(())
     }
@@ -473,10 +489,15 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
     /// # Panics
     /// Panics if `pos >= num_pairs()`.
     pub fn remove(&mut self, pos: usize) {
-        let n          = read_u16(self.data, OFF_LEAF_SLOT_COUNT) as usize;
+        let n = read_u16(self.data, OFF_LEAF_SLOT_COUNT) as usize;
         let free_start = read_u16(self.data, OFF_LEAF_FREE_START) as usize;
-        let hkl        = read_u16(self.data, OFF_LEAF_HIGH_KEY_LEN) as usize;
-        assert!(pos < n, "LeafPageMutator::remove: pos {} out of bounds (n={})", pos, n);
+        let hkl = read_u16(self.data, OFF_LEAF_HIGH_KEY_LEN) as usize;
+        assert!(
+            pos < n,
+            "LeafPageMutator::remove: pos {} out of bounds (n={})",
+            pos,
+            n
+        );
 
         let src = slot_offset_at(hkl, pos + 1);
         let len = (n - pos - 1) * SLOT_SIZE;
@@ -487,8 +508,12 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
         let vacated = slot_offset_at(hkl, n - 1);
         self.data[vacated..vacated + SLOT_SIZE].fill(0);
 
-        write_u16(self.data, OFF_LEAF_SLOT_COUNT,  (n - 1) as u16);
-        write_u16(self.data, OFF_LEAF_FREE_START,  (free_start - SLOT_SIZE) as u16);
+        write_u16(self.data, OFF_LEAF_SLOT_COUNT, (n - 1) as u16);
+        write_u16(
+            self.data,
+            OFF_LEAF_FREE_START,
+            (free_start - SLOT_SIZE) as u16,
+        );
     }
 
     // NOTE: compact() has been removed. In the MVCC model, there is no dead
@@ -502,11 +527,11 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
 
 /// Write-once constructor for a fresh leaf page.
 pub struct LeafPageBuilder<'a, K: Key, V: Value> {
-    data:      &'a mut [u8],
+    data: &'a mut [u8],
     write_end: usize,
-    hkl:       usize, // high_key_len, cached for slot offset calculation
-    _key:      PhantomData<K>,
-    _val:      PhantomData<V>,
+    hkl: usize, // high_key_len, cached for slot offset calculation
+    _key: PhantomData<K>,
+    _val: PhantomData<V>,
 }
 
 impl<'a, K: Key, V: Value> LeafPageBuilder<'a, K, V> {
@@ -514,13 +539,19 @@ impl<'a, K: Key, V: Value> LeafPageBuilder<'a, K, V> {
     /// pointers. High key defaults to 0 (rightmost, +infinity).
     pub fn new(page_id: PageId, data: &'a mut [u8]) -> Self {
         data.fill(0);
-        write_u8 (data, OFF_PAGE_TYPE,       LEAF);
-        write_u64(data, OFF_PAGE_ID,         page_id);
+        write_u8(data, OFF_PAGE_TYPE, LEAF);
+        write_u64(data, OFF_PAGE_ID, page_id);
         // high_key_len = 0 by default (rightmost page).
         // Slot directory starts at slot_base(0) = 48.
         write_u16(data, OFF_LEAF_FREE_START, slot_base(0) as u16);
-        write_u16(data, OFF_LEAF_FREE_END,   PAGE_SIZE as u16);
-        Self { data, write_end: PAGE_SIZE, hkl: 0, _key: PhantomData, _val: PhantomData }
+        write_u16(data, OFF_LEAF_FREE_END, PAGE_SIZE as u16);
+        Self {
+            data,
+            write_end: PAGE_SIZE,
+            hkl: 0,
+            _key: PhantomData,
+            _val: PhantomData,
+        }
     }
 
     pub fn set_prev_page(&mut self, prev: Option<PageId>) {
@@ -565,11 +596,11 @@ impl<'a, K: Key, V: Value> LeafPageBuilder<'a, K, V> {
         let key_bytes = key_bytes.as_ref();
         let val_bytes = V::as_bytes(value);
         let val_bytes = val_bytes.as_ref();
-        let key_len  = key_bytes.len();
-        let val_len  = val_bytes.len();
+        let key_len = key_bytes.len();
+        let val_len = val_bytes.len();
         let rec_size = rec_total_size(key_len, val_len);
 
-        let n          = read_u16(self.data, OFF_LEAF_SLOT_COUNT) as usize;
+        let n = read_u16(self.data, OFF_LEAF_SLOT_COUNT) as usize;
         let free_start = slot_base(self.hkl) + n * SLOT_SIZE;
 
         assert!(
@@ -593,12 +624,16 @@ impl<'a, K: Key, V: Value> LeafPageBuilder<'a, K, V> {
         self.data[val_off..val_off + val_len].copy_from_slice(val_bytes);
 
         let slot_off = slot_offset_at(self.hkl, n);
-        write_u16(self.data, slot_off,     rec_base as u16);
+        write_u16(self.data, slot_off, rec_base as u16);
         write_u16(self.data, slot_off + 2, rec_size as u16);
 
-        write_u16(self.data, OFF_LEAF_SLOT_COUNT,  (n + 1) as u16);
-        write_u16(self.data, OFF_LEAF_FREE_START,  (slot_off + SLOT_SIZE) as u16);
-        write_u16(self.data, OFF_LEAF_FREE_END,    rec_base as u16);
+        write_u16(self.data, OFF_LEAF_SLOT_COUNT, (n + 1) as u16);
+        write_u16(
+            self.data,
+            OFF_LEAF_FREE_START,
+            (slot_off + SLOT_SIZE) as u16,
+        );
+        write_u16(self.data, OFF_LEAF_FREE_END, rec_base as u16);
     }
 
     /// Seal the page. Returns a [`LeafPageMutator`] for any remaining header
@@ -633,11 +668,8 @@ mod tests {
 
     #[test]
     fn build_and_read_entries() {
-        let pairs: &[(&[u8], &[u8])] = &[
-            (b"apple",  b"AAA"),
-            (b"banana", b"BBB"),
-            (b"cherry", b"CCC"),
-        ];
+        let pairs: &[(&[u8], &[u8])] =
+            &[(b"apple", b"AAA"), (b"banana", b"BBB"), (b"cherry", b"CCC")];
         let buf = build_page(42, pairs);
         let acc = LeafPageAccessor::<K, V>::new(buf.memory());
 
@@ -852,7 +884,8 @@ mod tests {
             let mut m = LeafPageMutator::<K, V>::new(buf.memory_mut());
             if m.as_accessor().can_fit_direct(big_key.len(), big_val.len()) {
                 let n = m.as_accessor().num_pairs() as usize;
-                m.insert(n, &big_key.as_slice(), &big_val.as_slice()).unwrap();
+                m.insert(n, &big_key.as_slice(), &big_val.as_slice())
+                    .unwrap();
             } else {
                 let result = m.insert(0, &big_key.as_slice(), &big_val.as_slice());
                 assert!(matches!(result, Err(PageError::InsufficientSpace { .. })));

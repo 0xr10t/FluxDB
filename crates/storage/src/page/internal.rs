@@ -40,24 +40,22 @@
 //! └──────────────────────────────────────────────────────────┘
 //! ```
 
+use common::Key;
 use std::cmp::Ordering;
 use std::marker::PhantomData;
-use common::Key;
 
 use super::{
-    read_u8, read_u16, read_u32, read_u64,
-    write_u8, write_u16, write_u32, write_u64,
-    ChildSide, Lsn, PageError, PageId,
-    OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, INTERNAL,
+    ChildSide, INTERNAL, Lsn, OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, PageError, PageId, read_u8,
+    read_u16, read_u32, read_u64, write_u8, write_u16, write_u32, write_u64,
 };
 
 // ── Internal-page-specific header offsets ────────────────────────────────────
 
-const OFF_INT_NUM_KEYS:     usize = 2;   // u16
-const OFF_INT_HIGH_KEY_LEN: usize = 4;   // u16
+const OFF_INT_NUM_KEYS: usize = 2; // u16
+const OFF_INT_HIGH_KEY_LEN: usize = 4; // u16
 // bytes 6..8: u16 padding
-const OFF_INT_RIGHTLINK:    usize = 24;  // u64
-const INT_HEADER_SIZE:      usize = 32;
+const OFF_INT_RIGHTLINK: usize = 24; // u64
+const INT_HEADER_SIZE: usize = 32;
 
 // ── Offset calculation helpers ────────────────────────────────────────────────
 
@@ -104,10 +102,14 @@ impl<'a, K: Key> InternalPageAccessor<'a, K> {
     /// Panics if the page-type byte does not equal [`INTERNAL`].
     pub fn new(data: &'a [u8]) -> Self {
         assert_eq!(
-            read_u8(data, OFF_PAGE_TYPE), INTERNAL,
+            read_u8(data, OFF_PAGE_TYPE),
+            INTERNAL,
             "InternalPageAccessor: page type byte is not INTERNAL"
         );
-        Self { data, _key: PhantomData }
+        Self {
+            data,
+            _key: PhantomData,
+        }
     }
 
     pub fn lsn(&self) -> Lsn {
@@ -140,7 +142,9 @@ impl<'a, K: Key> InternalPageAccessor<'a, K> {
     /// Raw high key bytes, or `None` if this is the rightmost page (+infinity).
     pub fn high_key_bytes(&self) -> Option<&'a [u8]> {
         let len = self.high_key_len() as usize;
-        if len == 0 { return None; }
+        if len == 0 {
+            return None;
+        }
         Some(&self.data[super::PAGE_SIZE - len..super::PAGE_SIZE])
     }
 
@@ -173,7 +177,7 @@ impl<'a, K: Key> InternalPageAccessor<'a, K> {
         while low < high {
             let mid = low + (high - low) / 2;
             match K::compare(self.key_bytes_at(mid), search_bytes) {
-                Ordering::Greater              => high = mid,
+                Ordering::Greater => high = mid,
                 Ordering::Less | Ordering::Equal => low = mid + 1,
             }
         }
@@ -205,7 +209,7 @@ impl<'a, K: Key> InternalPageAccessor<'a, K> {
     /// Raw bytes for `key[i]`. Lifetime `'a` lets `key_at` pass the slice
     /// directly to `K::from_bytes` without a copy.
     fn key_bytes_at(&self, i: usize) -> &'a [u8] {
-        let n    = self.num_keys() as usize;
+        let n = self.num_keys() as usize;
         let base = int_key_data_base(n);
         let start = if i == 0 {
             0
@@ -243,10 +247,14 @@ impl<'a, K: Key> InternalPageMutator<'a, K> {
     /// Panics if the page-type byte does not equal [`INTERNAL`].
     pub fn new(data: &'a mut [u8]) -> Self {
         assert_eq!(
-            read_u8(data, OFF_PAGE_TYPE), INTERNAL,
+            read_u8(data, OFF_PAGE_TYPE),
+            INTERNAL,
             "InternalPageMutator: page type byte is not INTERNAL"
         );
-        Self { data, _key: PhantomData }
+        Self {
+            data,
+            _key: PhantomData,
+        }
     }
 
     pub fn set_lsn(&mut self, lsn: Lsn) {
@@ -288,8 +296,8 @@ impl<'a, K: Key> InternalPageMutator<'a, K> {
     /// Returns `Err(InsufficientSpace)` when the page is too full.
     pub fn insert_key_and_right_child(
         &mut self,
-        index:       usize,
-        key:         &K::SelfType<'_>,
+        index: usize,
+        key: &K::SelfType<'_>,
         right_child: PageId,
     ) -> Result<(), PageError> {
         let key_bytes = K::as_bytes(key);
@@ -297,7 +305,7 @@ impl<'a, K: Key> InternalPageMutator<'a, K> {
 
         if !self.as_accessor().can_fit(key_bytes.len()) {
             return Err(PageError::InsufficientSpace {
-                needed:    8 + 4 + key_bytes.len(),
+                needed: 8 + 4 + key_bytes.len(),
                 available: self.as_accessor().free_bytes(),
             });
         }
@@ -318,8 +326,12 @@ impl<'a, K: Key> InternalPageMutator<'a, K> {
         let (mut children, mut keys) = self.snapshot();
         keys.remove(index);
         match keep {
-            ChildSide::Left  => { children.remove(index + 1); }
-            ChildSide::Right => { children.remove(index); }
+            ChildSide::Left => {
+                children.remove(index + 1);
+            }
+            ChildSide::Right => {
+                children.remove(index);
+            }
         }
         self.rewrite(&children, &keys);
     }
@@ -427,10 +439,10 @@ impl<'a, K: Key> InternalPageMutator<'a, K> {
 
 /// Write-once constructor for a fresh internal page.
 pub struct InternalPageBuilder<'a, K: Key> {
-    data:     &'a mut [u8],
-    keys:     Vec<Vec<u8>>,
+    data: &'a mut [u8],
+    keys: Vec<Vec<u8>>,
     children: Vec<PageId>,
-    _key:     PhantomData<K>,
+    _key: PhantomData<K>,
 }
 
 impl<'a, K: Key> InternalPageBuilder<'a, K> {
@@ -438,10 +450,15 @@ impl<'a, K: Key> InternalPageBuilder<'a, K> {
     /// Rightlink and high_key default to 0 (rightmost, +infinity).
     pub fn new(page_id: PageId, data: &'a mut [u8]) -> Self {
         data.fill(0);
-        write_u8 (data, OFF_PAGE_TYPE, INTERNAL);
-        write_u64(data, OFF_PAGE_ID,   page_id);
+        write_u8(data, OFF_PAGE_TYPE, INTERNAL);
+        write_u64(data, OFF_PAGE_ID, page_id);
         // rightlink = 0 (rightmost), high_key_len = 0 (+infinity) — already zero
-        Self { data, keys: Vec::new(), children: Vec::new(), _key: PhantomData }
+        Self {
+            data,
+            keys: Vec::new(),
+            children: Vec::new(),
+            _key: PhantomData,
+        }
     }
 
     /// Register the leftmost child. Must be called exactly once, before any
@@ -485,7 +502,12 @@ impl<'a, K: Key> InternalPageBuilder<'a, K> {
     /// Seal the page: flush all buffered data with the correct layout, then
     /// return a mutator for remaining header writes (lsn, etc.).
     pub fn finish(self) -> InternalPageMutator<'a, K> {
-        let Self { data, keys, children, .. } = self;
+        let Self {
+            data,
+            keys,
+            children,
+            ..
+        } = self;
         let num_keys = keys.len();
 
         write_u16(data, OFF_INT_NUM_KEYS, num_keys as u16);
@@ -520,11 +542,7 @@ mod tests {
 
     /// Build an internal page from a slice of (key_bytes, right_child) pairs
     /// with an explicit leftmost child.
-    fn build_page(
-        page_id:     u64,
-        first_child: u64,
-        entries:     &[(&[u8], u64)],
-    ) -> PageBuffer {
+    fn build_page(page_id: u64, first_child: u64, entries: &[(&[u8], u64)]) -> PageBuffer {
         let mut buf = PageBuffer::new();
         let mut builder = InternalPageBuilder::<&[u8]>::new(page_id, buf.memory_mut());
         builder.push_first_child(first_child);
@@ -537,11 +555,7 @@ mod tests {
 
     #[test]
     fn build_and_read_keys_and_children() {
-        let buf = build_page(
-            1,
-            10,
-            &[(&[5], 20), (&[10], 30), (&[15], 40)],
-        );
+        let buf = build_page(1, 10, &[(&[5], 20), (&[10], 30), (&[15], 40)]);
         let acc = InternalPageAccessor::<&[u8]>::new(buf.memory());
 
         assert_eq!(acc.page_id(), 1);
@@ -610,27 +624,28 @@ mod tests {
 
     #[test]
     fn find_child_binary_search() {
-        let buf = build_page(
-            1,
-            1,
-            &[(&[10], 2), (&[20], 3), (&[30], 4)],
-        );
+        let buf = build_page(1, 1, &[(&[10], 2), (&[20], 3), (&[30], 4)]);
         let acc = InternalPageAccessor::<&[u8]>::new(buf.memory());
 
         let (idx, pid) = acc.find_child(&(&[5][..]));
-        assert_eq!(idx, 0); assert_eq!(pid, 1);
+        assert_eq!(idx, 0);
+        assert_eq!(pid, 1);
 
         let (idx, pid) = acc.find_child(&(&[10][..]));
-        assert_eq!(idx, 1); assert_eq!(pid, 2);
+        assert_eq!(idx, 1);
+        assert_eq!(pid, 2);
 
         let (idx, pid) = acc.find_child(&(&[15][..]));
-        assert_eq!(idx, 1); assert_eq!(pid, 2);
+        assert_eq!(idx, 1);
+        assert_eq!(pid, 2);
 
         let (idx, pid) = acc.find_child(&(&[30][..]));
-        assert_eq!(idx, 3); assert_eq!(pid, 4);
+        assert_eq!(idx, 3);
+        assert_eq!(pid, 4);
 
         let (idx, pid) = acc.find_child(&(&[99][..]));
-        assert_eq!(idx, 3); assert_eq!(pid, 4);
+        assert_eq!(idx, 3);
+        assert_eq!(pid, 4);
     }
 
     #[test]
@@ -663,7 +678,8 @@ mod tests {
             let mut m = InternalPageMutator::<&[u8]>::new(buf.memory_mut());
             if m.as_accessor().can_fit(big_key.len()) {
                 let n = m.as_accessor().num_keys() as usize;
-                m.insert_key_and_right_child(n, &big_key.as_slice(), child_id).unwrap();
+                m.insert_key_and_right_child(n, &big_key.as_slice(), child_id)
+                    .unwrap();
                 child_id += 1;
             } else {
                 let result = m.insert_key_and_right_child(0, &big_key.as_slice(), 999);
@@ -676,8 +692,7 @@ mod tests {
     #[test]
     fn remove_key_keep_left_child() {
         let mut buf = build_page(1, 1, &[(&[10], 2), (&[20], 3)]);
-        InternalPageMutator::<&[u8]>::new(buf.memory_mut())
-            .remove_key_at(0, ChildSide::Left);
+        InternalPageMutator::<&[u8]>::new(buf.memory_mut()).remove_key_at(0, ChildSide::Left);
 
         let acc = InternalPageAccessor::<&[u8]>::new(buf.memory());
         assert_eq!(acc.num_keys(), 1);
@@ -689,8 +704,7 @@ mod tests {
     #[test]
     fn remove_key_keep_right_child() {
         let mut buf = build_page(1, 1, &[(&[10], 2), (&[20], 3)]);
-        InternalPageMutator::<&[u8]>::new(buf.memory_mut())
-            .remove_key_at(0, ChildSide::Right);
+        InternalPageMutator::<&[u8]>::new(buf.memory_mut()).remove_key_at(0, ChildSide::Right);
 
         let acc = InternalPageAccessor::<&[u8]>::new(buf.memory());
         assert_eq!(acc.num_keys(), 1);

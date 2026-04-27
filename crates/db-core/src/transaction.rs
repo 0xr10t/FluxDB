@@ -213,20 +213,14 @@ mod tests {
         is_visible(xmin, xmax, s, &tm)
     }
 
-    trait SnapTestExt {
-        fn is_com(&self, txn_id: u64) -> bool;
-        fn is_prog(&self, txn_id: u64) -> bool;
+    fn is_com(s: &Snapshot, txn_id: u64) -> bool {
+        let tm = TransactionManager::new();
+        s.is_committed(txn_id, &tm)
     }
 
-    impl SnapTestExt for Snapshot {
-        fn is_com(&self, txn_id: u64) -> bool {
-            let tm = TransactionManager::new();
-            self.is_committed(txn_id, &tm)
-        }
-        fn is_prog(&self, txn_id: u64) -> bool {
-            let tm = TransactionManager::new();
-            self.is_in_progress(txn_id, &tm)
-        }
+    fn is_prog(s: &Snapshot, txn_id: u64) -> bool {
+        let tm = TransactionManager::new();
+        s.is_in_progress(txn_id, &tm)
     }
 
     // ── Snapshot::latest() ────────────────────────────────────────────────
@@ -310,36 +304,36 @@ mod tests {
     #[test]
     fn is_committed_below_xmin() {
         let s = snap(10, 20, &[]);
-        assert!(s.is_com(5));
+        assert!(is_com(&s, 5));
     }
 
     #[test]
     fn is_committed_in_active() {
         let s = snap(10, 20, &[12]);
-        assert!(!s.is_com(12));
+        assert!(!is_com(&s, 12));
     }
 
     #[test]
     fn is_committed_between_not_active() {
         let s = snap(10, 20, &[12]);
-        assert!(s.is_com(15)); // between 10 and 20, not in active
+        assert!(is_com(&s, 15)); // between 10 and 20, not in active
     }
 
     #[test]
     fn is_in_progress_in_active() {
         let s = snap(10, 20, &[12]);
-        assert!(s.is_prog(12));
+        assert!(is_prog(&s, 12));
     }
 
     #[test]
     fn is_in_progress_future() {
         let s = snap(10, 20, &[]);
-        assert!(s.is_prog(25)); // >= xmax → treat as in-progress
+        assert!(is_prog(&s, 25)); // >= xmax → treat as in-progress
     }
 
     #[test]
     fn is_in_progress_committed() {
         let s = snap(10, 20, &[]);
-        assert!(!s.is_prog(5)); // < xmin → finished
+        assert!(!is_prog(&s, 5)); // < xmin → finished
     }
 }

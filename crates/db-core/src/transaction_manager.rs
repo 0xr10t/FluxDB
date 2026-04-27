@@ -33,6 +33,10 @@ use std::{
 use crate::transaction::{Snapshot, TXN_ID, Transaction};
 
 /// Represents the deterministic final state of a transaction.
+///
+/// A transaction starts as `Active`, and then transitions to either `Committed`
+/// (success) or `Aborted` (failure/rollback). These states are tracked in
+/// the Commit Log (CLOG).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionStatus {
     Active,
@@ -41,6 +45,13 @@ pub enum TransactionStatus {
 }
 
 /// Global tracking for MVCC isolation rules and the commit log (CLOG).
+///
+/// the `TransactionManager` is the single source of truth for:
+/// 1. **Transaction ID generation**: Monotonically increasing `u64` IDs.
+/// 2. **Snapshot Creation**: Tracking which transactions are active to build
+///    consistent point-in-time views.
+/// 3. **Commit Log (CLOG)**: Recording the final status of every transaction
+///    to resolve visibility during record scans.
 #[derive(Debug)]
 pub struct TransactionManager {
     pub clog: RwLock<HashMap<u64, TransactionStatus>>,
@@ -48,6 +59,7 @@ pub struct TransactionManager {
 }
 
 impl TransactionManager {
+    /// Creates a new, empty `TransactionManager`.
     pub fn new() -> Self {
         Self {
             clog: RwLock::new(HashMap::new()),
@@ -55,6 +67,12 @@ impl TransactionManager {
         }
     }
 
+    /// Begins a new transaction synchronously, establishing its `Snapshot`.
+    ///
+    /// This method is thread-safe and enforces strict lock ordering to prevent
+    /// race conditions. It acquires a write-lock on the active set *before*
+    /// generating the new ID, ensuring that concurrent snapshot generators
+    /// always see a consistent state.
     pub fn begin(self: &std::sync::Arc<Self>) -> Transaction {
         // Write-lock active_txns FIRST to prevent race conditions with get_snapshot.
         // We must lock before fetching TXN_ID to ensure that no snapshot is
@@ -86,6 +104,10 @@ impl TransactionManager {
         }
     }
 
+    /// Marks a transaction as committed in the CLOG and removes it from the active set.
+    ///
+    /// Once committed, the transaction's writes become eligible for visibility
+    /// to new snapshots.
     pub fn commit(&self, txn_id: u64) {
         self.clog
             .write()
@@ -94,6 +116,11 @@ impl TransactionManager {
         self.active_txns.write().unwrap().remove(&txn_id);
     }
 
+    /// Marks a transaction as aborted in the CLOG and removes it from the active set.
+    ///
+    /// **Note**: The caller (e.g., storage engine) is responsible for rolling back
+    /// any physical writes or undo logs associated with this transaction before
+    /// or after calling this method.
     pub fn abort(&self, txn_id: u64) {
         // TODO: The storage/undo layer must rollback writes before calling this.
         self.clog
@@ -103,6 +130,7 @@ impl TransactionManager {
         self.active_txns.write().unwrap().remove(&txn_id);
     }
 
+    /// Returns `true` if the transaction is recorded as `Committed` in the CLOG.
     pub fn is_committed(&self, txn_id: u64) -> bool {
         if txn_id == 0 {
             return true;
@@ -110,14 +138,20 @@ impl TransactionManager {
         self.clog.read().unwrap().get(&txn_id) == Some(&TransactionStatus::Committed)
     }
 
+    /// Returns `true` if the transaction is recorded as `Aborted` in the CLOG.
     pub fn is_aborted(&self, txn_id: u64) -> bool {
         self.clog.read().unwrap().get(&txn_id) == Some(&TransactionStatus::Aborted)
     }
 
+    /// Returns `true` if the transaction is currently in the active set.
     pub fn is_active(&self, txn_id: u64) -> bool {
         self.active_txns.read().unwrap().contains(&txn_id)
     }
 
+    /// Generates a "latest" snapshot from the current manager state.
+    ///
+    /// This captures the current `xmin`, `xmax`, and active set. It is typically
+    /// used for ad-hoc reads or by `begin()` to initialize a transaction's view.
     pub fn get_snapshot(&self) -> Snapshot {
         // Read lock active_txns to guarantee consistency
         let active = self.active_txns.read().unwrap();

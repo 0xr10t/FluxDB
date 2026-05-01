@@ -986,13 +986,15 @@ mod tests {
     use crate::buffer_pool::manager::BufferPoolManager;
     use crate::disk::DiskManager;
     use common::MAX_PAGE_SIZE;
-    use std::sync::Arc;
+    use std::mem::forget;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::{Arc, OnceLock};
     use tempfile::tempdir;
 
     fn make_index() -> BTreeIndex<&'static [u8], &'static [u8]> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        std::mem::forget(dir);
+        forget(dir);
         let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
         let pool = Arc::new(BufferPoolManager::new(disk));
         let (index, _) = BTreeIndex::create(pool).unwrap();
@@ -1000,18 +1002,15 @@ mod tests {
     }
 
     fn auto() -> Transaction {
-        static TM_LOCK: std::sync::OnceLock<
-            std::sync::Arc<db_core::transaction_manager::TransactionManager>,
-        > = std::sync::OnceLock::new();
+        static TM_LOCK: OnceLock<Arc<db_core::transaction_manager::TransactionManager>> =
+            OnceLock::new();
         let tm = TM_LOCK
-            .get_or_init(|| {
-                std::sync::Arc::new(db_core::transaction_manager::TransactionManager::new())
-            })
+            .get_or_init(|| Arc::new(db_core::transaction_manager::TransactionManager::new()))
             .clone();
 
-        static TEST_TXN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        static TEST_TXN_ID: AtomicU64 = AtomicU64::new(1);
         Transaction {
-            txn_id: TEST_TXN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            txn_id: TEST_TXN_ID.fetch_add(1, Relaxed),
             snapshot: db_core::transaction::Snapshot::latest(),
             tm,
         }

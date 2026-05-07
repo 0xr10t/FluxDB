@@ -51,6 +51,7 @@
 //! ```
 
 use common::{Key, Value};
+use db_core::{transaction, transaction_manager::TransactionManager};
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 
@@ -516,11 +517,65 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
         );
     }
 
-    // NOTE: compact() has been removed. In the MVCC model, there is no dead
-    // space from overwrites (overwrite_value is gone — updates create new
-    // records). Dead records (xmax != 0) are reclaimed by vacuum, not inline
-    // during inserts.
-    // TODO! implement vacuum to reclaim dead records where xmax < global_xmin
+    /// Reclaims space by physically removing dead records.
+    ///
+    /// This rebuilds the page in-place, keeping only records that are NOT
+    /// considered vacuumable under the current `global_xmin` horizon.
+    /// Returns the number of records removed.
+    pub fn compact(
+        page_id: PageId,
+        page_data: &mut [u8],
+        horizon: u64,
+        tm: &TransactionManager,
+    ) -> usize {
+        let acc = LeafPageAccessor::<K, V>::new(page_data);
+        let n = acc.num_pairs() as usize;
+
+        // 1. Gather all non-vacuumable records.
+        let mut live: Vec<(Vec<u8>, Vec<u8>, u64, u64)> = Vec::with_capacity(n);
+        let mut dead_count = 0;
+
+        for i in 0..n {
+            let xmin = acc.get_xmin(i);
+            let xmax = acc.get_xmax(i);
+
+            if transaction::is_vacuumable(xmin, xmax, horizon, tm) {
+                dead_count += 1;
+                continue;
+            }
+
+            let k = K::as_bytes(&acc.get_key(i)).as_ref().to_vec();
+            let v = V::as_bytes(&acc.get_value(i)).as_ref().to_vec();
+            live.push((k, v, xmin, xmax));
+        }
+
+        // 2. If no records were removed, don't touch the page.
+        if dead_count == 0 {
+            return 0;
+        }
+
+        // 3. Preserve page metadata before clearing.
+        let high_key: Option<Vec<u8>> = acc.high_key_bytes().map(|b| b.to_vec());
+        let rightlink = acc.rightlink();
+        let prev_page = acc.prev_page();
+        let lsn = acc.lsn();
+
+        // 4. Rebuild the page using the Builder.
+        let mut builder = LeafPageBuilder::<K, V>::new(page_id, page_data);
+        if let Some(ref hk) = high_key {
+            builder.set_high_key(hk);
+        }
+        builder.set_rightlink(rightlink);
+        builder.set_prev_page(prev_page);
+        for (k, v, xmin, xmax) in &live {
+            builder.push_with_mvcc(&K::from_bytes(k), &V::from_bytes(v), *xmin, *xmax);
+        }
+
+        let mut m = builder.finish();
+        m.set_lsn(lsn);
+
+        dead_count
+    }
 }
 
 // ── LeafPageBuilder ───────────────────────────────────────────────────────────
@@ -938,5 +993,46 @@ mod tests {
         let buf = build_page(1, &[]);
         let acc = LeafPageAccessor::<K, V>::new(buf.memory());
         assert!(acc.can_fit_direct(10, 10));
+    }
+
+    #[test]
+    fn compact_removes_dead_records() {
+        let tm = TransactionManager::new();
+        tm.commit(10); // deleter of record 1
+        tm.abort(20); // creator of record 2 (never valid)
+
+        let mut buf = crate::page::PageBuffer::new();
+        {
+            let mut b = LeafPageBuilder::<K, V>::new(1, buf.memory_mut());
+            // 0: Live (xmin=1, xmax=0)
+            b.push_with_mvcc(&b"k0".as_ref(), &b"v0".as_ref(), 1, 0);
+            // 1: Dead (xmin=1, xmax=10, horizon=15)
+            b.push_with_mvcc(&b"k1".as_ref(), &b"v1".as_ref(), 1, 10);
+            // 2: Dead (xmin=20, xmax=0) -> creator aborted
+            b.push_with_mvcc(&b"k2".as_ref(), &b"v2".as_ref(), 20, 0);
+            b.finish();
+        }
+
+        let removed = LeafPageMutator::<K, V>::compact(1, buf.memory_mut(), 15, &tm);
+        assert_eq!(removed, 2);
+
+        let acc = LeafPageAccessor::<K, V>::new(buf.memory());
+        assert_eq!(acc.num_pairs(), 1);
+        assert_eq!(acc.get_key(0), b"k0".as_ref());
+    }
+
+    #[test]
+    fn compact_no_dead_records_is_noop() {
+        let tm = TransactionManager::new();
+        let mut buf = crate::page::PageBuffer::new();
+        {
+            let mut b = LeafPageBuilder::<K, V>::new(1, buf.memory_mut());
+            b.push_with_mvcc(&b"k0".as_ref(), &b"v0".as_ref(), 1, 0);
+            b.finish();
+        }
+
+        let removed = LeafPageMutator::<K, V>::compact(1, buf.memory_mut(), 100, &tm);
+        assert_eq!(removed, 0);
+        assert_eq!(LeafPageAccessor::<K, V>::new(buf.memory()).num_pairs(), 1);
     }
 }

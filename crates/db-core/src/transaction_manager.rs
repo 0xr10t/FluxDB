@@ -79,19 +79,17 @@ impl TransactionManager {
     /// read operations (e.g., in B+-tree scans), ensuring that transactions
     /// which have not yet begun do not affect the visibility of committed data.
     pub fn global_xmin(&self) -> u64 {
-        let active_txs = self.active_txns.read().unwrap();
-        if active_txs.is_empty() {
-            self.next_txn_id.load(Acquire)
-        } else {
-            active_txs.iter().min().cloned().unwrap()
-        }
+        let active = self.active_txns.read().unwrap();
+        active
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or_else(|| self.next_txn_id.load(Acquire))
     }
 
     pub fn truncate_clog(&self, horizon: u64) {
         let mut clog = self.clog.write().unwrap();
-        clog.retain(|&txn_id, status| {
-            txn_id >= horizon || *status == TransactionStatus::Active
-        });
+        clog.retain(|&txn_id, status| txn_id >= horizon || *status == TransactionStatus::Active);
     }
 
     /// Begins a new transaction synchronously, establishing its `Snapshot`.

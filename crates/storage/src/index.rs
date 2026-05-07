@@ -19,7 +19,6 @@ use crate::page::{
     INTERNAL, InternalPageAccessor, InternalPageBuilder, InternalPageMutator, LEAF,
     LeafPageAccessor, LeafPageBuilder, LeafPageMutator, PageId,
 };
-use crate::vacuum::compact_leaf_page;
 
 use db_core::transaction::Transaction;
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -88,26 +87,37 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         }
     }
 
-    pub fn vacuum(&self, tm: &TransactionManager) -> Result<()> {
+    /// Reclaims storage space by physically removing dead record versions.
+    ///
+    /// This method performs a full sequential scan of all leaf pages in the
+    /// B+Tree. For each page, it identifies "dead" tuples (those not visible
+    /// to any active transaction snapshot) and removes them, compacting the
+    /// page in-place to reclaim bytes for future inserts.
+    ///
+    /// Returns the total number of records removed across all pages.
+    pub fn vacuum(&self, tm: &TransactionManager) -> Result<usize> {
         let global_xmin = tm.global_xmin();
         let root = self.root_page_id();
         let mut leaf_pid = self.find_leftmost_leaf(root)?;
+        let mut total_dead = 0;
 
         loop {
-            let mut guard = self.pool.fetch_page_mut(leaf_pid);
+            let mut guard = self.pool.fetch_page_mut(leaf_pid)?;
 
-            let _dead = compact_leaf_page::<K, V>(&mut guard[..], leaf_pid, tm);
+            total_dead +=
+                LeafPageMutator::<K, V>::compact(leaf_pid, &mut guard[..], global_xmin, tm);
+
             let acc = LeafPageAccessor::<K, V>::new(&guard[..]);
-            match acc.rightlink() {
-                Some(next) => {
-                    drop(guard);
-                    leaf_pid = next;
-                }
+            let next = acc.rightlink();
+            drop(guard);
+
+            match next {
+                Some(pid) => leaf_pid = pid,
                 None => break,
             }
         }
 
-        Ok(())
+        Ok(total_dead)
     }
 
     pub fn create(pool: Arc<BufferPoolManager>) -> Result<(Self, PageId)> {
@@ -1301,5 +1311,38 @@ mod tests {
             Err(IndexError::WriteConflict) => {}
             other => panic!("expected WriteConflict, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn vacuum_reclaims_space() {
+        let tm = std::sync::Arc::new(db_core::transaction_manager::TransactionManager::new());
+        let idx = make_index();
+
+        // 1. Insert 100 keys and commit.
+        for i in 0u32..100 {
+            let k = i.to_be_bytes();
+            let txn = tm.begin();
+            idx.insert(&(k.as_ref()), &(k.as_ref()), &txn).unwrap();
+            tm.commit(txn.txn_id);
+        }
+
+        // 2. Delete 50 keys and commit.
+        for i in 0u32..50 {
+            let k = i.to_be_bytes();
+            let txn = tm.begin();
+            idx.delete(&(k.as_ref()), &txn).unwrap();
+            tm.commit(txn.txn_id);
+        }
+
+        // 3. Run vacuum. Since all transactions committed, it should reclaim 50 records.
+        let removed = idx.vacuum(&tm).unwrap();
+        assert_eq!(removed, 50);
+
+        // 4. Verify data is still visible for the 50 live keys.
+        let results: Vec<_> = idx
+            .range::<std::ops::RangeFull>(.., &tm.begin())
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(results.len(), 50);
     }
 }

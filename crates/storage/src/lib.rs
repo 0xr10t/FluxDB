@@ -2,5 +2,4 @@ pub mod buffer_pool;
 pub mod disk;
 pub mod index;
 pub mod page;
-pub mod vacuum;
 pub mod wal;

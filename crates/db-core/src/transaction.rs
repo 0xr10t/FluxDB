@@ -145,7 +145,6 @@ impl Snapshot {
         }
         self.active.contains(&txn_id)
     }
-
 }
 
 /// Determines whether a record with `(rec_xmin, rec_xmax)` is visible to
@@ -189,6 +188,29 @@ pub fn is_visible(rec_xmin: u64, rec_xmax: u64, snap: &Snapshot, tm: &Transactio
     // The deleter hasn't committed → the deletion hasn't "happened" from
     // our perspective → the record is still visible.
     true
+}
+
+/// Determines whether a record version with `(xmin, xmax)` is "definitely dead"
+/// and safe to be physically removed from storage.
+///
+/// A record is vacuumable if:
+/// 1. Its creator (`xmin`) aborted (it was never valid).
+/// 2. OR it was deleted/replaced by a transaction (`xmax`) that is:
+///    - Committed
+///    - AND older than the global horizon (no active txn can see the old state).
+pub fn is_vacuumable(xmin: u64, xmax: u64, horizon: u64, tm: &TransactionManager) -> bool {
+    // 1. Aborted records are always dead.
+    if tm.is_aborted(xmin) {
+        return true;
+    }
+
+    // 2. If not deleted (xmax=0) or the deleter hasn't committed yet, it's live.
+    if xmax == 0 || !tm.is_committed(xmax) {
+        return false;
+    }
+
+    // 3. Deleted by committed txn < horizon: no one will ever see it again.
+    xmax < horizon
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -332,5 +354,46 @@ mod tests {
     fn is_in_progress_committed() {
         let s = snap(10, 20, &[]);
         assert!(!is_prog(&s, 5)); // < xmin → finished
+    }
+
+    // ── is_vacuumable ───────────────────────────────────────────────────
+
+    #[test]
+    fn vacuumable_aborted_creator() {
+        let tm = TransactionManager::new();
+        tm.abort(5); // xmin=5 aborted
+        // Creator aborted -> always dead
+        assert!(is_vacuumable(5, 0, 100, &tm));
+        assert!(is_vacuumable(5, 15, 10, &tm));
+    }
+
+    #[test]
+    fn vacuumable_not_deleted_is_live() {
+        let tm = TransactionManager::new();
+        // xmin=5 committed, xmax=0 -> live
+        assert!(!is_vacuumable(5, 0, 100, &tm));
+    }
+
+    #[test]
+    fn vacuumable_committed_deleter_below_horizon() {
+        let tm = TransactionManager::new();
+        tm.commit(15); // xmax=15 committed
+        // xmax=15 < horizon=20 -> dead
+        assert!(is_vacuumable(5, 15, 20, &tm));
+    }
+
+    #[test]
+    fn vacuumable_committed_deleter_above_horizon_is_live() {
+        let tm = TransactionManager::new();
+        tm.commit(15); // xmax=15 committed
+        // xmax=15 >= horizon=10 -> live (someone might still see the old version)
+        assert!(!is_vacuumable(5, 15, 10, &tm));
+    }
+
+    #[test]
+    fn vacuumable_in_progress_deleter_is_live() {
+        let tm = TransactionManager::new();
+        // xmax=15 in-progress -> live
+        assert!(!is_vacuumable(5, 15, 100, &tm));
     }
 }

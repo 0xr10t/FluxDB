@@ -24,13 +24,16 @@
 //!    It is recorded as `Aborted` in the CLOG and removed from `active_txns`. Its writes
 //!    will remain invisible to all future transactions and can be garbage collected.
 
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{
+    AtomicU64,
+    Ordering::{AcqRel, Acquire},
+};
 use std::{
     collections::{HashMap, HashSet},
     sync::RwLock,
 };
 
-use crate::transaction::{Snapshot, TXN_ID, Transaction};
+use crate::transaction::{Snapshot, Transaction};
 
 /// Represents the deterministic final state of a transaction.
 ///
@@ -54,6 +57,7 @@ pub enum TransactionStatus {
 ///    to resolve visibility during record scans.
 #[derive(Debug)]
 pub struct TransactionManager {
+    pub next_txn_id: AtomicU64,
     pub clog: RwLock<HashMap<u64, TransactionStatus>>,
     pub active_txns: RwLock<HashSet<u64>>,
 }
@@ -62,6 +66,7 @@ impl TransactionManager {
     /// Creates a new, empty `TransactionManager`.
     pub fn new() -> Self {
         Self {
+            next_txn_id: AtomicU64::new(1),
             clog: RwLock::new(HashMap::new()),
             active_txns: RwLock::new(HashSet::new()),
         }
@@ -79,11 +84,11 @@ impl TransactionManager {
         // generated in between ID creation and active set insertion.
         let mut active = self.active_txns.write().unwrap();
 
-        let txn_id = TXN_ID.fetch_add(1, Relaxed);
+        let txn_id = self.next_txn_id.fetch_add(1, AcqRel);
         active.insert(txn_id);
 
         let xmin = *active.iter().min().unwrap_or(&txn_id);
-        let xmax = TXN_ID.load(Relaxed);
+        let xmax = self.next_txn_id.load(Acquire);
         let active_vec: Vec<u64> = active.iter().cloned().collect();
 
         drop(active);
@@ -155,7 +160,7 @@ impl TransactionManager {
     pub fn get_snapshot(&self) -> Snapshot {
         // Read lock active_txns to guarantee consistency
         let active = self.active_txns.read().unwrap();
-        let xmax = TXN_ID.load(Relaxed);
+        let xmax = self.next_txn_id.load(Acquire);
         Snapshot {
             xmin: *active.iter().min().unwrap_or(&xmax),
             xmax,

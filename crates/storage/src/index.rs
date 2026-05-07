@@ -12,12 +12,14 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, Mutex};
 
 use common::{Key, MAX_KEY_SIZE, Value};
+use db_core::transaction_manager::TransactionManager;
 
 use crate::buffer_pool::{BufferPoolError, BufferPoolManager, PageReadGuard, PageWriteGuard};
 use crate::page::{
     INTERNAL, InternalPageAccessor, InternalPageBuilder, InternalPageMutator, LEAF,
     LeafPageAccessor, LeafPageBuilder, LeafPageMutator, PageId,
 };
+use crate::vacuum::compact_leaf_page;
 
 use db_core::transaction::Transaction;
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -84,6 +86,28 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             _key: PhantomData,
             _val: PhantomData,
         }
+    }
+
+    pub fn vacuum(&self, tm: &TransactionManager) -> Result<()> {
+        let global_xmin = tm.global_xmin();
+        let root = self.root_page_id();
+        let mut leaf_pid = self.find_leftmost_leaf(root)?;
+
+        loop {
+            let mut guard = self.pool.fetch_page_mut(leaf_pid);
+
+            let _dead = compact_leaf_page::<K, V>(&mut guard[..], leaf_pid, tm);
+            let acc = LeafPageAccessor::<K, V>::new(&guard[..]);
+            match acc.rightlink() {
+                Some(next) => {
+                    drop(guard);
+                    leaf_pid = next;
+                }
+                None => break,
+            }
+        }
+
+        Ok(())
     }
 
     pub fn create(pool: Arc<BufferPoolManager>) -> Result<(Self, PageId)> {

@@ -72,6 +72,28 @@ impl TransactionManager {
         }
     }
 
+    /// Returns the minimum `txn_id` currently in the active set (the global
+    /// minimum transaction ID that is still executing).
+    ///
+    /// This is used to determine the lower bound for visibility checks in
+    /// read operations (e.g., in B+-tree scans), ensuring that transactions
+    /// which have not yet begun do not affect the visibility of committed data.
+    pub fn global_xmin(&self) -> u64 {
+        let active_txs = self.active_txns.read().unwrap();
+        if active_txs.is_empty() {
+            self.next_txn_id.load(Acquire)
+        } else {
+            active_txs.iter().min().cloned().unwrap()
+        }
+    }
+
+    pub fn truncate_clog(&self, horizon: u64) {
+        let mut clog = self.clog.write().unwrap();
+        clog.retain(|&txn_id, status| {
+            txn_id >= horizon || *status == TransactionStatus::Active
+        });
+    }
+
     /// Begins a new transaction synchronously, establishing its `Snapshot`.
     ///
     /// This method is thread-safe and enforces strict lock ordering to prevent

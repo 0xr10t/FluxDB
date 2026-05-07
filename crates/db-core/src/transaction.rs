@@ -145,6 +145,7 @@ impl Snapshot {
         }
         self.active.contains(&txn_id)
     }
+
 }
 
 /// Determines whether a record with `(rec_xmin, rec_xmax)` is visible to

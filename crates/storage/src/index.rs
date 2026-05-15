@@ -251,7 +251,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     Ok(()) => {}
                     Err(IndexError::WaitFor(blocking_txn)) => {
                         drop(leaf_guard);
-                        Self::wait_for_txn(&txn.tm, blocking_txn);
+                        Self::wait_for_txn(&txn.tm, blocking_txn, txn.txn_id)?;
                         leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
                         continue;
                     }
@@ -593,14 +593,21 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         Ok(())
     }
 
-    /// Spin until `txn_id` is no longer active in the CLOG.
+    /// Wait for `blocking_txn` to settle using Wait-Die deadlock prevention.
     ///
-    /// Must be called with no page latches held to avoid blocking other
-    /// threads on the same page while waiting.
-    fn wait_for_txn(tm: &TransactionManager, txn_id: u64) {
-        while tm.is_active(txn_id) {
+    /// If the caller is younger than the blocker (higher txn_id), it dies
+    /// immediately rather than waiting — this prevents circular waits where
+    /// two transactions spin on each other across different keys.
+    ///
+    /// Must be called with no page latches held.
+    fn wait_for_txn(tm: &TransactionManager, blocking_txn: u64, my_txn_id: u64) -> Result<()> {
+        if my_txn_id > blocking_txn {
+            return Err(IndexError::WriteConflict);
+        }
+        while tm.is_active(blocking_txn) {
             std::hint::spin_loop();
         }
+        Ok(())
     }
 
     /// First-writer-wins conflict check before setting xmax on a record.

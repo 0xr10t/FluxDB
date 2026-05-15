@@ -35,6 +35,9 @@ pub enum IndexError {
     /// Another in-progress transaction has already modified this record.
     /// First-writer-wins: the current transaction should abort.
     WriteConflict,
+    /// An in-progress transaction is blocking this insert. The caller should
+    /// drop its page latch, wait for `txn_id` to settle, then retry.
+    WaitFor(u64),
     UnexpectedPageType {
         expected: u8,
         found: u8,
@@ -219,42 +222,51 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
         };
 
-        // ── Phase 2: Exclusive latch on leaf + rightlink correction ──────
+        // ── Phase 2+3: Latch, conflict check, insert (retry on WaitFor) ──
+        //
+        // If check_insert_conflict returns WaitFor(blocking_txn), we must
+        // drop the latch before waiting — holding it while sleeping would
+        // block every other reader/writer on this page.
         let mut leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
         loop {
-            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-            if let Some(hk) = acc.high_key_bytes() {
-                if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
-                    let right = acc.rightlink().unwrap();
-                    drop(leaf_guard);
-                    leaf_guard = self.pool.fetch_page_mut(right)?;
-                    continue;
+            // Rightlink correction: follow splits that happened during descent.
+            loop {
+                let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+                if let Some(hk) = acc.high_key_bytes() {
+                    if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
+                        let right = acc.rightlink().unwrap();
+                        drop(leaf_guard);
+                        leaf_guard = self.pool.fetch_page_mut(right)?;
+                        continue;
+                    }
+                }
+                break;
+            }
+
+            let (slot, exact) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
+
+            if exact {
+                let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+                match self.check_insert_conflict(&acc, slot, key, txn) {
+                    Ok(()) => {}
+                    Err(IndexError::WaitFor(blocking_txn)) => {
+                        drop(leaf_guard);
+                        Self::wait_for_txn(&txn.tm, blocking_txn);
+                        leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 }
             }
-            break;
-        }
 
-        // ── Phase 3: Conflict detection + insert ─────────────────────────
-        let (slot, exact) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
-
-        if exact {
-            // Key exists — check for conflicts among duplicate versions.
-            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-            self.check_insert_conflict(&acc, slot, key, txn)?;
-        }
-
-        // Insert new record.
-        let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(slot, key, value);
-
-        match result {
-            Ok(()) => {
-                // Set xmin to the inserting transaction.
-                LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
-                return Ok(());
-            }
-            Err(_) => {
-                return self.split_and_insert(leaf_guard, key, value, txn.txn_id, &mut stack);
-            }
+            let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(slot, key, value);
+            return match result {
+                Ok(()) => {
+                    LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
+                    Ok(())
+                }
+                Err(_) => self.split_and_insert(leaf_guard, key, value, txn.txn_id, &mut stack),
+            };
         }
     }
 
@@ -556,10 +568,11 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             let xmax = acc.get_xmax(i);
 
             // If xmin is in-progress (uncommitted insert by another txn),
-            // that txn might commit → would create a duplicate.
+            // signal the caller to release the latch and wait. After the
+            // blocking txn settles: if it committed this becomes DuplicateKey
+            // on the retry; if it aborted the slot disappears and we proceed.
             if xmin != txn.txn_id && txn.is_in_progress(xmin) {
-                // TODO! wait-for-commit: block until xmin txn commits/aborts
-                return Err(IndexError::WriteConflict);
+                return Err(IndexError::WaitFor(xmin));
             }
 
             // If the record is visible to us, it's a duplicate.
@@ -568,15 +581,26 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
 
             // If xmax is in-progress (another txn is deleting this version),
-            // that deletion might abort → the record would reappear as live.
+            // signal the caller to wait. After settling: if it committed the
+            // record is gone and our insert is valid; if it aborted the record
+            // is still live and we'll find a visible duplicate on the retry.
             if xmax != 0 && xmax != txn.txn_id && txn.is_in_progress(xmax) {
-                // TODO! wait-for-commit: block until xmax txn commits/aborts
-                return Err(IndexError::WriteConflict);
+                return Err(IndexError::WaitFor(xmax));
             }
 
             i += 1;
         }
         Ok(())
+    }
+
+    /// Spin until `txn_id` is no longer active in the CLOG.
+    ///
+    /// Must be called with no page latches held to avoid blocking other
+    /// threads on the same page while waiting.
+    fn wait_for_txn(tm: &TransactionManager, txn_id: u64) {
+        while tm.is_active(txn_id) {
+            std::hint::spin_loop();
+        }
     }
 
     /// First-writer-wins conflict check before setting xmax on a record.

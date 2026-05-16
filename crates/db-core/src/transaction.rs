@@ -100,14 +100,9 @@ impl Snapshot {
     /// perspective?
     ///
     /// A transaction is committed if:
+    /// - The CLOG records it as committed or aborted (authoritative), OR
     /// - Its ID is below `xmin` (finished before snapshot was taken), OR
-    /// - Its ID is between `xmin` and `xmax` AND not in the active list
-    ///   (it started before the snapshot but already committed).
-    ///
-    /// # Future work
-    /// This currently infers commit status from the snapshot alone. A real
-    /// implementation must consult the CLOG (commit-status table) to
-    /// distinguish committed from aborted transactions.
+    /// - Its ID is between `xmin` and `xmax` AND not in the active list.
     pub fn is_committed(&self, txn_id: u64, tm: &TransactionManager) -> bool {
         if txn_id == 0 {
             return true; // txn_id 0 is the "auto" transaction, always committed

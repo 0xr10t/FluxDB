@@ -1,6 +1,6 @@
+use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::mem::size_of;
-use std::cmp::Ordering;
 use thiserror::Error;
 
 /// Errors that can occur when deserializing a [`TypeName`] from raw bytes.
@@ -17,7 +17,7 @@ pub enum TypeNameError {
 #[derive(Eq, PartialEq, Debug, Clone)]
 enum TypeClassification {
     Internal,
-    UserDefined
+    UserDefined,
 }
 
 impl TypeClassification {
@@ -45,9 +45,10 @@ pub struct TypeName {
 
 impl TypeName {
     pub fn new(name: &str) -> Self {
-        TypeName { 
-            classification: TypeClassification::UserDefined, 
-            name: name.to_string() }
+        TypeName {
+            classification: TypeClassification::UserDefined,
+            name: name.to_string(),
+        }
     }
 
     pub fn internal(name: &str) -> Self {
@@ -70,7 +71,10 @@ impl TypeName {
         }
         let classification = TypeClassification::from_byte(bytes[0])?;
         let name = std::str::from_utf8(&bytes[1..])?.to_string();
-        Ok(Self { classification, name })
+        Ok(Self {
+            classification,
+            name,
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -79,7 +83,7 @@ impl TypeName {
 }
 pub trait Value: Debug {
     //`SelfType<'a>` must be the same type as Self with all lifetimes replaced with 'a
-    ///deserialized representation 
+    ///deserialized representation
     type SelfType<'a>: Debug + 'a
     where
         Self: 'a;
@@ -89,7 +93,7 @@ pub trait Value: Debug {
         Self: 'a;
 
     // Width of a fixed type, or None for variable width
-    // tells the compiler if type is fixed width, example: u32 
+    // tells the compiler if type is fixed width, example: u32
     fn fixed_width() -> Option<usize>;
 
     /// Deserializes data
@@ -112,7 +116,6 @@ pub trait Key: Value {
     /// Compare data1 with data2
     fn compare(data1: &[u8], data2: &[u8]) -> Ordering;
 }
-
 
 impl Value for () {
     type SelfType<'a>
@@ -154,7 +157,6 @@ impl Key for () {
         Ordering::Equal
     }
 }
-
 
 impl Value for bool {
     type SelfType<'a>
@@ -204,7 +206,6 @@ impl Key for bool {
     }
 }
 
-
 impl Value for &[u8] {
     type SelfType<'a>
         = &'a [u8]
@@ -243,7 +244,6 @@ impl Key for &[u8] {
         data1.cmp(data2)
     }
 }
-
 
 impl<const N: usize, T: Value> Value for [T; N] {
     type SelfType<'a>

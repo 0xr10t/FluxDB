@@ -21,6 +21,9 @@
 //! by an active transaction, the current transaction loses (returns
 //! `WriteConflict`). The first transaction to set `xmax` wins.
 
+use crate::transaction_manager::TransactionManager;
+use std::sync::Arc;
+
 /// A transaction's identity and its point-in-time view of the database.
 ///
 /// All B+Tree operations (`get`, `insert`, `delete`, `update`, `range`)
@@ -31,19 +34,27 @@ pub struct Transaction {
     pub txn_id: u64,
     /// The snapshot taken at the start of this transaction.
     pub snapshot: Snapshot,
+    /// The manager tracking commit log entries for visibility checking.
+    pub tm: Arc<TransactionManager>,
 }
 
 impl Transaction {
-    /// Creates a transaction that sees all committed data.
-    ///
-    /// Uses `txn_id = 1` (not 0, because xmax=0 means "live") and
-    /// `Snapshot::latest()`. Suitable for single-threaded use or when
-    /// no transaction manager is wired.
-    pub fn auto() -> Self {
-        Self {
-            txn_id: 1,
-            snapshot: Snapshot::latest(),
-        }
+    /// Determines whether a record with `(rec_xmin, rec_xmax)` is visible to
+    /// this transaction.
+    pub fn is_visible(&self, rec_xmin: u64, rec_xmax: u64) -> bool {
+        is_visible(rec_xmin, rec_xmax, &self.snapshot, &self.tm)
+    }
+
+    /// Is the given transaction considered committed from this transaction's
+    /// perspective?
+    pub fn is_committed(&self, txn_id: u64) -> bool {
+        self.snapshot.is_committed(txn_id, &self.tm)
+    }
+
+    /// Is the given transaction still in-progress from this transaction's
+    /// perspective?
+    pub fn is_in_progress(&self, txn_id: u64) -> bool {
+        self.snapshot.is_in_progress(txn_id, &self.tm)
     }
 }
 
@@ -89,17 +100,18 @@ impl Snapshot {
     /// perspective?
     ///
     /// A transaction is committed if:
+    /// - The CLOG records it as committed or aborted (authoritative), OR
     /// - Its ID is below `xmin` (finished before snapshot was taken), OR
-    /// - Its ID is between `xmin` and `xmax` AND not in the active list
-    ///   (it started before the snapshot but already committed).
-    ///
-    /// # Future work
-    /// This currently infers commit status from the snapshot alone. A real
-    /// implementation must consult the CLOG (commit-status table) to
-    /// distinguish committed from aborted transactions.
-    pub fn is_committed(&self, txn_id: u64) -> bool {
+    /// - Its ID is between `xmin` and `xmax` AND not in the active list.
+    pub fn is_committed(&self, txn_id: u64, tm: &TransactionManager) -> bool {
         if txn_id == 0 {
             return true; // txn_id 0 is the "auto" transaction, always committed
+        }
+        if tm.is_aborted(txn_id) {
+            return false;
+        }
+        if tm.is_committed(txn_id) {
+            return true;
         }
         if txn_id < self.xmin {
             return true; // finished before snapshot
@@ -109,13 +121,15 @@ impl Snapshot {
         }
         // Between xmin and xmax: committed if NOT in active list
         !self.active.contains(&txn_id)
-        // TODO! consult CLOG for actual commit/abort status
     }
 
     /// Is the given transaction still in-progress from this snapshot's
     /// perspective?
-    pub fn is_in_progress(&self, txn_id: u64) -> bool {
+    pub fn is_in_progress(&self, txn_id: u64, tm: &TransactionManager) -> bool {
         if txn_id == 0 {
+            return false;
+        }
+        if tm.is_committed(txn_id) || tm.is_aborted(txn_id) {
             return false;
         }
         if txn_id < self.xmin {
@@ -150,9 +164,9 @@ impl Snapshot {
 /// Record (xmin=5,  xmax=15) → visible   (deleter in-progress, deletion not final)
 /// Record (xmin=25, xmax=0)  → invisible (creator hasn't started yet)
 /// ```
-pub fn is_visible(rec_xmin: u64, rec_xmax: u64, snap: &Snapshot) -> bool {
+pub fn is_visible(rec_xmin: u64, rec_xmax: u64, snap: &Snapshot, tm: &TransactionManager) -> bool {
     // Step 1: The creating transaction must be committed.
-    if !snap.is_committed(rec_xmin) {
+    if !snap.is_committed(rec_xmin, tm) {
         return false;
     }
 
@@ -162,13 +176,36 @@ pub fn is_visible(rec_xmin: u64, rec_xmax: u64, snap: &Snapshot) -> bool {
     }
 
     // Step 3: If the deleting transaction committed, the record is gone.
-    if snap.is_committed(rec_xmax) {
+    if snap.is_committed(rec_xmax, tm) {
         return false;
     }
 
     // The deleter hasn't committed → the deletion hasn't "happened" from
     // our perspective → the record is still visible.
     true
+}
+
+/// Determines whether a record version with `(xmin, xmax)` is "definitely dead"
+/// and safe to be physically removed from storage.
+///
+/// A record is vacuumable if:
+/// 1. Its creator (`xmin`) aborted (it was never valid).
+/// 2. OR it was deleted/replaced by a transaction (`xmax`) that is:
+///    - Committed
+///    - AND older than the global horizon (no active txn can see the old state).
+pub fn is_vacuumable(xmin: u64, xmax: u64, horizon: u64, tm: &TransactionManager) -> bool {
+    // 1. Aborted records are always dead.
+    if tm.is_aborted(xmin) {
+        return true;
+    }
+
+    // 2. If not deleted (xmax=0) or the deleter hasn't committed yet, it's live.
+    if xmax == 0 || !tm.is_committed(xmax) {
+        return false;
+    }
+
+    // 3. Deleted by committed txn < horizon: no one will ever see it again.
+    xmax < horizon
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -178,7 +215,26 @@ mod tests {
     use super::*;
 
     fn snap(xmin: u64, xmax: u64, active: &[u64]) -> Snapshot {
-        Snapshot { xmin, xmax, active: active.to_vec() }
+        Snapshot {
+            xmin,
+            xmax,
+            active: active.to_vec(),
+        }
+    }
+
+    fn is_vis(xmin: u64, xmax: u64, s: &Snapshot) -> bool {
+        let tm = TransactionManager::new();
+        is_visible(xmin, xmax, s, &tm)
+    }
+
+    fn is_com(s: &Snapshot, txn_id: u64) -> bool {
+        let tm = TransactionManager::new();
+        s.is_committed(txn_id, &tm)
+    }
+
+    fn is_prog(s: &Snapshot, txn_id: u64) -> bool {
+        let tm = TransactionManager::new();
+        s.is_in_progress(txn_id, &tm)
     }
 
     // ── Snapshot::latest() ────────────────────────────────────────────────
@@ -187,21 +243,21 @@ mod tests {
     fn latest_sees_live_record() {
         let s = Snapshot::latest();
         // xmin=5 committed (5 < MAX), xmax=0 → visible
-        assert!(is_visible(5, 0, &s));
+        assert!(is_vis(5, 0, &s));
     }
 
     #[test]
     fn latest_hides_deleted_record() {
         let s = Snapshot::latest();
         // xmin=5 committed, xmax=10 committed (10 < MAX) → invisible
-        assert!(!is_visible(5, 10, &s));
+        assert!(!is_vis(5, 10, &s));
     }
 
     #[test]
     fn latest_auto_txn_visible() {
         let s = Snapshot::latest();
         // xmin=0 (auto txn), xmax=0 → visible
-        assert!(is_visible(0, 0, &s));
+        assert!(is_vis(0, 0, &s));
     }
 
     // ── Committed vs in-progress ─────────────────────────────────────────
@@ -210,28 +266,28 @@ mod tests {
     fn committed_creator_visible() {
         let s = snap(10, 20, &[12, 15]);
         // xmin=5 < 10 → committed → visible
-        assert!(is_visible(5, 0, &s));
+        assert!(is_vis(5, 0, &s));
     }
 
     #[test]
     fn in_progress_creator_invisible() {
         let s = snap(10, 20, &[12, 15]);
         // xmin=12 in active list → not committed → invisible
-        assert!(!is_visible(12, 0, &s));
+        assert!(!is_vis(12, 0, &s));
     }
 
     #[test]
     fn future_creator_invisible() {
         let s = snap(10, 20, &[]);
         // xmin=25 >= xmax=20 → not started → invisible
-        assert!(!is_visible(25, 0, &s));
+        assert!(!is_vis(25, 0, &s));
     }
 
     #[test]
     fn committed_between_xmin_xmax_visible() {
         let s = snap(10, 20, &[12, 15]);
         // xmin=13: between 10 and 20, NOT in active → committed → visible
-        assert!(is_visible(13, 0, &s));
+        assert!(is_vis(13, 0, &s));
     }
 
     // ── Deletion visibility ──────────────────────────────────────────────
@@ -240,21 +296,21 @@ mod tests {
     fn committed_deletion_hides_record() {
         let s = snap(10, 20, &[12, 15]);
         // xmin=5 committed, xmax=8 committed (8 < 10) → deleted → invisible
-        assert!(!is_visible(5, 8, &s));
+        assert!(!is_vis(5, 8, &s));
     }
 
     #[test]
     fn in_progress_deletion_keeps_record_visible() {
         let s = snap(10, 20, &[12, 15]);
         // xmin=5 committed, xmax=15 in active → deletion not final → visible
-        assert!(is_visible(5, 15, &s));
+        assert!(is_vis(5, 15, &s));
     }
 
     #[test]
     fn future_deletion_keeps_record_visible() {
         let s = snap(10, 20, &[]);
         // xmin=5 committed, xmax=25 >= xmax → future → visible
-        assert!(is_visible(5, 25, &s));
+        assert!(is_vis(5, 25, &s));
     }
 
     // ── is_committed / is_in_progress ────────────────────────────────────
@@ -262,52 +318,77 @@ mod tests {
     #[test]
     fn is_committed_below_xmin() {
         let s = snap(10, 20, &[]);
-        assert!(s.is_committed(5));
+        assert!(is_com(&s, 5));
     }
 
     #[test]
     fn is_committed_in_active() {
         let s = snap(10, 20, &[12]);
-        assert!(!s.is_committed(12));
+        assert!(!is_com(&s, 12));
     }
 
     #[test]
     fn is_committed_between_not_active() {
         let s = snap(10, 20, &[12]);
-        assert!(s.is_committed(15)); // between 10 and 20, not in active
+        assert!(is_com(&s, 15)); // between 10 and 20, not in active
     }
 
     #[test]
     fn is_in_progress_in_active() {
         let s = snap(10, 20, &[12]);
-        assert!(s.is_in_progress(12));
+        assert!(is_prog(&s, 12));
     }
 
     #[test]
     fn is_in_progress_future() {
         let s = snap(10, 20, &[]);
-        assert!(s.is_in_progress(25)); // >= xmax → treat as in-progress
+        assert!(is_prog(&s, 25)); // >= xmax → treat as in-progress
     }
 
     #[test]
     fn is_in_progress_committed() {
         let s = snap(10, 20, &[]);
-        assert!(!s.is_in_progress(5)); // < xmin → finished
+        assert!(!is_prog(&s, 5)); // < xmin → finished
     }
 
-    // ── Transaction::auto() ──────────────────────────────────────────────
+    // ── is_vacuumable ───────────────────────────────────────────────────
 
     #[test]
-    fn auto_txn_id_is_nonzero() {
-        let txn = Transaction::auto();
-        assert_ne!(txn.txn_id, 0); // must be non-zero so xmax=txn_id means "dead"
+    fn vacuumable_aborted_creator() {
+        let tm = TransactionManager::new();
+        tm.abort(5); // xmin=5 aborted
+        // Creator aborted -> always dead
+        assert!(is_vacuumable(5, 0, 100, &tm));
+        assert!(is_vacuumable(5, 15, 10, &tm));
     }
 
     #[test]
-    fn auto_snapshot_is_latest() {
-        let txn = Transaction::auto();
-        assert_eq!(txn.snapshot.xmin, u64::MAX);
-        assert_eq!(txn.snapshot.xmax, u64::MAX);
-        assert!(txn.snapshot.active.is_empty());
+    fn vacuumable_not_deleted_is_live() {
+        let tm = TransactionManager::new();
+        // xmin=5 committed, xmax=0 -> live
+        assert!(!is_vacuumable(5, 0, 100, &tm));
+    }
+
+    #[test]
+    fn vacuumable_committed_deleter_below_horizon() {
+        let tm = TransactionManager::new();
+        tm.commit(15); // xmax=15 committed
+        // xmax=15 < horizon=20 -> dead
+        assert!(is_vacuumable(5, 15, 20, &tm));
+    }
+
+    #[test]
+    fn vacuumable_committed_deleter_above_horizon_is_live() {
+        let tm = TransactionManager::new();
+        tm.commit(15); // xmax=15 committed
+        // xmax=15 >= horizon=10 -> live (someone might still see the old version)
+        assert!(!is_vacuumable(5, 15, 10, &tm));
+    }
+
+    #[test]
+    fn vacuumable_in_progress_deleter_is_live() {
+        let tm = TransactionManager::new();
+        // xmax=15 in-progress -> live
+        assert!(!is_vacuumable(5, 15, 100, &tm));
     }
 }

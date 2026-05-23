@@ -3,41 +3,17 @@
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::Write,
     path::{Path, PathBuf},
 };
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
+use common::DiskError;
+
 /// Represents a unique identifier for a page in the database.
 pub type PageId = u64;
-
-/// Errors that can occur during disk operations.
-#[derive(Debug)]
-pub enum DiskError {
-    /// An underlying I/O error.
-    Io(io::Error),
-    /// The provided buffer or data size does not match the configured page size.
-    InvalidPageSize,
-}
-
-impl std::fmt::Display for DiskError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DiskError::Io(err) => write!(f, "IO error: {}", err),
-            DiskError::InvalidPageSize => write!(f, "Invalid page size"),
-        }
-    }
-}
-
-impl std::error::Error for DiskError {}
-
-impl From<io::Error> for DiskError {
-    fn from(err: io::Error) -> Self {
-        DiskError::Io(err)
-    }
-}
 
 pub type Result<T> = std::result::Result<T, DiskError>;
 

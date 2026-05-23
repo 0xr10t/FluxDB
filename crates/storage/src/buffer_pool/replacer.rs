@@ -3,8 +3,9 @@
 //! This module implements the Clock replacement policy, a common approximation
 //! of the Least Recently Used (LRU) algorithm.
 
-use crate::buffer_pool::BufferPoolError;
-use crate::buffer_pool::Result;
+use common::BufferPoolError;
+
+type Result<T> = std::result::Result<T, BufferPoolError>;
 
 /// An implementation of the Clock replacement algorithm.
 ///

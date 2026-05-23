@@ -4,13 +4,15 @@
 //! reduces lock contention by allowing multiple threads to access different
 //! partitions of the buffer pool simultaneously.
 
-use crate::buffer_pool::manager::{BufferPoolError, Result};
+use common::BufferPoolError;
 use crate::buffer_pool::replacer::ClockReplacer;
 use crate::disk::DiskManager;
 use common::{INVALID_FRAME_ID, MAX_PAGE_SIZE};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+type Result<T> = std::result::Result<T, BufferPoolError>;
 
 /// A fixed-size buffer for a single database page.
 pub struct PageData(pub Box<[u8; MAX_PAGE_SIZE]>);
@@ -292,11 +294,9 @@ impl BufferPoolShard {
         }
 
         self.disk_manager
-            .write_page(page_id, &buf)
-            .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+            .write_page(page_id, &buf)?;
         self.disk_manager
-            .sync_data()
-            .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+            .sync_data()?;
         Ok(())
     }
 

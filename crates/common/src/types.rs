@@ -1,18 +1,7 @@
 use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::mem::size_of;
-use thiserror::Error;
-
-/// Errors that can occur when deserializing a [`TypeName`] from raw bytes.
-#[derive(Debug, Error)]
-pub enum TypeNameError {
-    #[error("empty input: need at least 1 byte for the classification tag")]
-    Empty,
-    #[error("unknown classification byte: {0}")]
-    UnknownClassification(u8),
-    #[error("invalid UTF-8 in type name: {0}")]
-    InvalidUtf8(#[from] std::str::Utf8Error),
-}
+use crate::TypeNameError;
 
 #[derive(Eq, PartialEq, Debug, Clone)]
 enum TypeClassification {

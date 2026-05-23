@@ -12,7 +12,7 @@ pub mod leaf;
 pub use internal::{InternalPageAccessor, InternalPageBuilder, InternalPageMutator};
 pub use leaf::{LeafPageAccessor, LeafPageBuilder, LeafPageMutator};
 
-use thiserror::Error;
+pub use common::PageError;
 
 // ── Type aliases ──────────────────────────────────────────────────────────────
 
@@ -38,14 +38,6 @@ pub(super) const OFF_PAGE_TYPE: usize = 0; // u8
 // Byte 1 is reserved (was `flags`, never used).
 pub(super) const OFF_PAGE_ID: usize = 8; // u64
 pub(super) const OFF_LSN: usize = 16; // u64
-
-// ── Shared error type ─────────────────────────────────────────────────────────
-
-#[derive(Debug, Error)]
-pub enum PageError {
-    #[error("insufficient space: needed {needed} bytes but only {available} available")]
-    InsufficientSpace { needed: usize, available: usize },
-}
 
 // ── ChildSide — used when removing a separator key during a merge ─────────────
 

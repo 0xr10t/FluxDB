@@ -392,7 +392,6 @@ dependencies = [
  "crc32fast",
  "db-core",
  "tempfile",
- "thiserror",
 ]
 
 [[package]]

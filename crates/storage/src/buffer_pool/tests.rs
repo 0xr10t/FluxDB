@@ -125,7 +125,7 @@ fn test_buffer_pool_manager_concurrency() {
 
 #[test]
 fn test_buffer_pool_manager_pin_count() {
-    use crate::buffer_pool::manager::BufferPoolError;
+    use common::BufferPoolError;
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
     let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());

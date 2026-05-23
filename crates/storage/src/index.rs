@@ -14,42 +14,14 @@ use std::sync::{Arc, Mutex};
 use common::{Key, MAX_KEY_SIZE, Value};
 use db_core::transaction_manager::TransactionManager;
 
-use crate::buffer_pool::{BufferPoolError, BufferPoolManager, PageReadGuard, PageWriteGuard};
+use common::IndexError;
+use crate::buffer_pool::{BufferPoolManager, PageReadGuard, PageWriteGuard};
 use crate::page::{
     INTERNAL, InternalPageAccessor, InternalPageBuilder, InternalPageMutator, LEAF,
     LeafPageAccessor, LeafPageBuilder, LeafPageMutator, PageId,
 };
 
 use db_core::transaction::Transaction;
-// ── Error type ────────────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-pub enum IndexError {
-    KeyNotFound,
-    KeyTooLarge {
-        size: usize,
-        max: usize,
-    },
-    /// Insert attempted on a key that already has a visible version.
-    DuplicateKey,
-    /// Another in-progress transaction has already modified this record.
-    /// First-writer-wins: the current transaction should abort.
-    WriteConflict,
-    /// An in-progress transaction is blocking this insert. The caller should
-    /// drop its page latch, wait for `txn_id` to settle, then retry.
-    WaitFor(u64),
-    UnexpectedPageType {
-        expected: u8,
-        found: u8,
-    },
-    BufferPool(BufferPoolError),
-}
-
-impl From<BufferPoolError> for IndexError {
-    fn from(e: BufferPoolError) -> Self {
-        IndexError::BufferPool(e)
-    }
-}
 
 pub type Result<T> = std::result::Result<T, IndexError>;
 
@@ -723,16 +695,14 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         if target_pid == leaf_pid_actual {
             let (s, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
-                .insert(s, key, value)
-                .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+                .insert(s, key, value)?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(s, txn_id);
         } else {
             drop(leaf_guard);
             let mut right = self.pool.fetch_page_mut(target_pid)?;
             let (s, _) = LeafPageAccessor::<K, V>::new(&right[..]).position(key);
             LeafPageMutator::<K, V>::new(&mut right[..])
-                .insert(s, key, value)
-                .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+                .insert(s, key, value)?;
             LeafPageMutator::<K, V>::new(&mut right[..]).set_xmin(s, txn_id);
         }
 
@@ -890,8 +860,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             if acc.can_fit(sep_key.len()) {
                 let (idx, _) = acc.find_child(&K::from_bytes(&sep_key));
                 InternalPageMutator::<K>::new(&mut parent_guard[..])
-                    .insert_key_and_right_child(idx, &K::from_bytes(&sep_key), right_pid)
-                    .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+                    .insert_key_and_right_child(idx, &K::from_bytes(&sep_key), right_pid)?;
                 return Ok(());
             }
 

@@ -1,31 +1,7 @@
 use crate::buffer_pool::shard::{BufferPoolShard, PageReadGuard, PageWriteGuard};
 use crate::disk::DiskManager;
-use common::{MAX_FRAMES, NUM_SHARDS, SHARD_MASK};
-use std::fmt::{Display, Formatter};
+use common::{BufferPoolError, MAX_FRAMES, NUM_SHARDS, SHARD_MASK};
 use std::sync::{Arc, Mutex};
-
-#[derive(Debug)]
-pub enum BufferPoolError {
-    PageNotFound(u64),
-    PinCountError,
-    NoEvictableFrames,
-    InternalError(String),
-}
-
-impl Display for BufferPoolError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BufferPoolError::PageNotFound(page_id) => {
-                write!(f, "Page with ID {} not found", page_id)
-            }
-            BufferPoolError::PinCountError => write!(f, "Pin count error"),
-            BufferPoolError::NoEvictableFrames => write!(f, "No evictable frames available"),
-            BufferPoolError::InternalError(msg) => write!(f, "Internal error: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for BufferPoolError {}
 
 pub type Result<T> = std::result::Result<T, BufferPoolError>;
 
@@ -127,8 +103,7 @@ impl BufferPoolManager {
             let mut data = shard.pages[frame_id].write().unwrap();
             shard
                 .disk_manager
-                .read_page(page_id, data.0.as_mut())
-                .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+                .read_page(page_id, data.0.as_mut())?;
         }
 
         let data = shard.pages[frame_id].read().unwrap();
@@ -169,8 +144,7 @@ impl BufferPoolManager {
         if needs_load {
             shard
                 .disk_manager
-                .read_page(page_id, data.0.as_mut())
-                .map_err(|e| BufferPoolError::InternalError(e.to_string()))?;
+                .read_page(page_id, data.0.as_mut())?;
         }
 
         Ok(PageWriteGuard {

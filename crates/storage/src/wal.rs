@@ -21,56 +21,15 @@
 //! | Checksum   | 4            | CRC32 of all preceding fields        |
 
 use crc32fast::Hasher;
-use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::vec;
 
+use common::WalError;
 use crate::disk::DiskManager;
 use crate::page::Lsn;
-
-#[derive(Debug)]
-pub enum WalError {
-    Io(io::Error),
-    ChecksumMismatch {
-        lsn: Lsn,
-        expected: u32,
-        actual: u32,
-    },
-    CorruptedLog(String),
-    InvalidEntryType(u8),
-    InvalidLsn,
-}
-
-impl From<io::Error> for WalError {
-    fn from(err: io::Error) -> Self {
-        WalError::Io(err)
-    }
-}
-
-impl Display for WalError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WalError::Io(err) => write!(f, "IO error: {}", err),
-            WalError::ChecksumMismatch {
-                lsn,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "Checksum mismatch for LSN {}: expected {}, got {}",
-                lsn, expected, actual
-            ),
-            WalError::CorruptedLog(msg) => write!(f, "Corrupted log: {}", msg),
-            WalError::InvalidEntryType(t) => write!(f, "Invalid entry type: {}", t),
-            WalError::InvalidLsn => write!(f, "Invalid LSN"),
-        }
-    }
-}
-
-impl std::error::Error for WalError {}
 
 pub type Result<T> = std::result::Result<T, WalError>;
 

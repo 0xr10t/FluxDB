@@ -40,8 +40,12 @@ jobs:
           additional_permissions: |
             actions: read
 
-          # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
-          # prompt: 'Update the pull request description to include a summary of changes.'
+          prompt: |
+            Before doing anything else, read CLAUDE.md at the root of this repository. It describes the project architecture (MVCC B+Tree engine, sharded buffer pool, WAL, TransactionManager), crate layout, error-handling conventions, and the Key/Value trait system. Use this as context for all responses.
+
+            Then carry out whatever was requested in the comment or review that tagged you.
+
+            When reviewing code or answering questions, be thorough and detailed. Structure your response with clear sections and explain your reasoning — do not give one-liners.
 
           # Optional: Add claude_args to customize behavior and configuration
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md

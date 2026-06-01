@@ -42,6 +42,11 @@ impl Transaction {
     /// Determines whether a record with `(rec_xmin, rec_xmax)` is visible to
     /// this transaction.
     pub fn is_visible(&self, rec_xmin: u64, rec_xmax: u64) -> bool {
+        if rec_xmin == self.txn_id {
+        // own write: visible unless we deleted it ourselves
+        // a transaction should be able to able to read its own inserts 
+        return rec_xmax == 0 || rec_xmax != self.txn_id;
+        }
         is_visible(rec_xmin, rec_xmax, &self.snapshot, &self.tm)
     }
 

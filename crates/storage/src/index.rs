@@ -591,17 +591,18 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
     /// Wait for `blocking_txn` to settle using Wait-Die deadlock prevention.
     ///
     /// If the caller is younger than the blocker (higher txn_id), it dies
-    /// immediately rather than waiting — this prevents circular waits where
-    /// two transactions spin on each other across different keys.
+    /// immediately — this prevents circular waits where two transactions
+    /// wait on each other across different keys.
+    ///
+    /// If the caller is older, it sleeps on a condvar until the blocker
+    /// commits or aborts, then returns so the caller can retry.
     ///
     /// Must be called with no page latches held.
     fn wait_for_txn(tm: &TransactionManager, blocking_txn: u64, my_txn_id: u64) -> Result<()> {
         if my_txn_id > blocking_txn {
             return Err(IndexError::WriteConflict);
         }
-        while tm.is_active(blocking_txn) {
-            std::hint::spin_loop();
-        }
+        tm.wait_until_settled(blocking_txn);
         Ok(())
     }
 

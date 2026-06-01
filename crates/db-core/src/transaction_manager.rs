@@ -30,7 +30,7 @@ use std::sync::atomic::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::RwLock,
+    sync::{Arc, Condvar, Mutex, RwLock},
 };
 
 use crate::transaction::{Snapshot, Transaction};
@@ -60,6 +60,9 @@ pub struct TransactionManager {
     pub next_txn_id: AtomicU64,
     pub clog: RwLock<HashMap<u64, TransactionStatus>>,
     pub active_txns: RwLock<HashSet<u64>>,
+    // Per-transaction condvars: threads waiting on a specific txn_id sleep here.
+    // Woken by commit() or abort() when that transaction settles.
+    waiters: Mutex<HashMap<u64, Arc<Condvar>>>,
 }
 
 impl TransactionManager {
@@ -69,6 +72,7 @@ impl TransactionManager {
             next_txn_id: AtomicU64::new(1),
             clog: RwLock::new(HashMap::new()),
             active_txns: RwLock::new(HashSet::new()),
+            waiters: Mutex::new(HashMap::new()),
         }
     }
 
@@ -132,27 +136,50 @@ impl TransactionManager {
     /// Marks a transaction as committed in the CLOG and removes it from the active set.
     ///
     /// Once committed, the transaction's writes become eligible for visibility
-    /// to new snapshots.
+    /// to new snapshots. Any threads waiting on this transaction via
+    /// `wait_until_settled` are woken up.
     pub fn commit(&self, txn_id: u64) {
         self.clog
             .write()
             .unwrap()
             .insert(txn_id, TransactionStatus::Committed);
         self.active_txns.write().unwrap().remove(&txn_id);
+        self.notify_waiters(txn_id);
     }
 
     /// Marks a transaction as aborted in the CLOG and removes it from the active set.
     ///
-    /// **Note**: The caller (e.g., storage engine) is responsible for rolling back
-    /// any physical writes or undo logs associated with this transaction before
-    /// or after calling this method.
+    /// Any threads waiting on this transaction via `wait_until_settled` are woken up.
     pub fn abort(&self, txn_id: u64) {
-        // TODO: The storage/undo layer must rollback writes before calling this.
         self.clog
             .write()
             .unwrap()
             .insert(txn_id, TransactionStatus::Aborted);
         self.active_txns.write().unwrap().remove(&txn_id);
+        self.notify_waiters(txn_id);
+    }
+
+    /// Block the calling thread until `blocking_txn` commits or aborts.
+    ///
+    /// Uses a per-transaction condvar so the thread sleeps instead of spinning.
+    /// The condvar is created lazily on first wait and removed after the
+    /// transaction settles.
+    pub fn wait_until_settled(&self, blocking_txn: u64) {
+        let cv = {
+            let mut waiters = self.waiters.lock().unwrap();
+            Arc::clone(waiters.entry(blocking_txn).or_insert_with(|| Arc::new(Condvar::new())))
+        };
+        // The condvar needs a mutex to wait on. We reuse the waiters mutex as
+        // the guard — lock it, check the condition, sleep if still active.
+        let waiters = self.waiters.lock().unwrap();
+        let _guard = cv.wait_while(waiters, |_| self.is_active(blocking_txn)).unwrap();
+    }
+
+    fn notify_waiters(&self, txn_id: u64) {
+        let cv = self.waiters.lock().unwrap().remove(&txn_id);
+        if let Some(cv) = cv {
+            cv.notify_all();
+        }
     }
 
     /// Returns `true` if the transaction is recorded as `Committed` in the CLOG.

@@ -101,7 +101,18 @@ impl BufferPoolManager {
 
         if needs_load {
             let mut data = shard.pages[frame_id].write().unwrap();
-            shard.disk_manager.read_page(page_id, data.0.as_mut())?;
+            shard
+                .disk_manager
+                .read_page(page_id, data.0.as_mut())?;
+            if let Err((expected, actual)) = crate::page::verify_checksum(&data[..]) {
+                drop(data); // drop is called to free the bytes for use by other thread. 
+                shard.discard_frame(page_id);
+                return Err(BufferPoolError::PageCorruption {
+                    page_id,
+                    expected,
+                    actual,
+                });
+            }
         }
 
         let data = shard.pages[frame_id].read().unwrap();
@@ -140,7 +151,18 @@ impl BufferPoolManager {
 
         let mut data = shard.pages[frame_id].write().unwrap();
         if needs_load {
-            shard.disk_manager.read_page(page_id, data.0.as_mut())?;
+            shard
+                .disk_manager
+                .read_page(page_id, data.0.as_mut())?;
+            if let Err((expected, actual)) = crate::page::verify_checksum(&data[..]) {
+                drop(data);
+                shard.discard_frame(page_id);
+                return Err(BufferPoolError::PageCorruption {
+                    page_id,
+                    expected,
+                    actual,
+                });
+            }
         }
 
         Ok(PageWriteGuard {

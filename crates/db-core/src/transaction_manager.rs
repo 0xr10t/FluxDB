@@ -166,33 +166,43 @@ impl TransactionManager {
     ///
     /// Returns immediately if the transaction has already settled. Otherwise
     /// sleeps on a per-transaction condvar that is woken by commit/abort.
-    /// The waiters map lock is never held while sleeping, avoiding lock-order
-    /// inversion with commit/abort.
+    ///
+    /// Lock ordering: this function never holds the waiters mutex while calling
+    /// is_active (which takes active_txns). commit/abort hold active_txns then
+    /// lock waiters in notify_waiters — so is_active must only be called
+    /// outside the waiters lock to avoid inversion.
     pub fn wait_until_settled(&self, blocking_txn: u64) {
         // Fast path: already settled, nothing to do.
         if !self.is_active(blocking_txn) {
             return;
         }
 
-        // Get or create the waiter entry while holding the map lock briefly.
+        // Install the waiter entry. Do NOT call is_active while holding the
+        // waiters mutex — that acquires active_txns and inverts the lock order
+        // used by commit/abort (active_txns → waiters).
         let entry: WaiterEntry = {
             let mut waiters = self.waiters.lock().unwrap();
-            // Re-check under the map lock — commit/abort may have fired between
-            // the fast-path check above and acquiring the map lock.
-            if !self.is_active(blocking_txn) {
-                return;
-            }
             Arc::clone(
                 waiters
                     .entry(blocking_txn)
                     .or_insert_with(|| Arc::new((Mutex::new(false), Condvar::new()))),
             )
-        }; // map lock released here
+        }; // waiters lock released here — safe to call is_active again
+
+        // Missed-wakeup guard: the transaction may have settled between the
+        // fast-path check above and installing our entry. notify_waiters would
+        // have found no entry at that point and done nothing. Check now:
+        // - if settled is already true, wait_while returns immediately below
+        // - if is_active is false but settled not yet true, clean up and return
+        if !self.is_active(blocking_txn) {
+            self.notify_waiters(blocking_txn);
+            return;
+        }
 
         // Sleep on the entry's own mutex — no map lock held during the wait.
         let (settled_lock, cv) = &*entry;
         let settled = settled_lock.lock().unwrap();
-        drop(cv.wait_while(settled, |&mut s| !s).unwrap());
+        drop(cv.wait_while(settled, |s| !*s).unwrap());
     }
 
     fn notify_waiters(&self, txn_id: u64) {
@@ -434,11 +444,32 @@ mod tests {
 
     #[test]
     fn waiter_map_cleaned_up_after_settle() {
-        let tm = std::sync::Arc::new(TransactionManager::new());
-        let txn = tm.begin();
-        let txn_id = txn.txn_id;
-        tm.commit(txn_id);
-        // Entry must not be in the map after settle — no memory leak.
-        assert!(!tm.waiters.lock().unwrap().contains_key(&txn_id));
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let tm = Arc::new(TransactionManager::new());
+        let blocker = tm.begin();
+        let blocker_id = blocker.txn_id;
+
+        let tm_clone = Arc::clone(&tm);
+        let waiter = thread::spawn(move || {
+            tm_clone.wait_until_settled(blocker_id);
+        });
+
+        // Give the waiter time to register its entry in the map.
+        thread::sleep(Duration::from_millis(20));
+
+        tm.commit(blocker_id);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !waiter.is_finished() {
+            assert!(Instant::now() < deadline, "waiter did not unblock");
+            thread::sleep(Duration::from_millis(5));
+        }
+        waiter.join().expect("waiter panicked");
+
+        // Entry must be removed from the map after settle — no memory leak.
+        assert!(!tm.waiters.lock().unwrap().contains_key(&blocker_id));
     }
 }

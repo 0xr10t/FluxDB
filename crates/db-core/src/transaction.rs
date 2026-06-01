@@ -43,9 +43,8 @@ impl Transaction {
     /// this transaction.
     pub fn is_visible(&self, rec_xmin: u64, rec_xmax: u64) -> bool {
         if rec_xmin == self.txn_id {
-        // own write: visible unless we deleted it ourselves
-        // a transaction should be able to able to read its own inserts 
-        return rec_xmax == 0 || rec_xmax != self.txn_id;
+            // Own write: visible unless we deleted it ourselves.
+            return rec_xmax != self.txn_id;
         }
         is_visible(rec_xmin, rec_xmax, &self.snapshot, &self.tm)
     }
@@ -395,5 +394,46 @@ mod tests {
         let tm = TransactionManager::new();
         // xmax=15 in-progress -> live
         assert!(!is_vacuumable(5, 15, 100, &tm));
+    }
+
+    // ── Self-visibility (read-your-own-writes) ───────────────────────────
+
+    fn make_txn(tm: &std::sync::Arc<TransactionManager>) -> Transaction {
+        tm.begin()
+    }
+
+    #[test]
+    fn own_insert_is_visible() {
+        let tm = std::sync::Arc::new(TransactionManager::new());
+        let txn = make_txn(&tm);
+        // xmin = own txn_id, xmax = 0 (not deleted) → must be visible
+        assert!(txn.is_visible(txn.txn_id, 0));
+    }
+
+    #[test]
+    fn own_deleted_record_is_invisible() {
+        let tm = std::sync::Arc::new(TransactionManager::new());
+        let txn = make_txn(&tm);
+        // xmin = own txn_id, xmax = own txn_id (we deleted it) → invisible
+        assert!(!txn.is_visible(txn.txn_id, txn.txn_id));
+    }
+
+    #[test]
+    fn own_record_deleted_by_other_is_visible() {
+        let tm = std::sync::Arc::new(TransactionManager::new());
+        let txn = make_txn(&tm);
+        // xmin = own txn_id, xmax = someone else's txn → still visible to us
+        assert!(txn.is_visible(txn.txn_id, txn.txn_id + 1));
+    }
+
+    #[test]
+    fn foreign_active_creator_invisible_to_self() {
+        // Sanity check: the self-visibility branch only fires for own txn_id.
+        // A record created by a different active transaction must remain invisible.
+        let tm = std::sync::Arc::new(TransactionManager::new());
+        let other = make_txn(&tm);
+        let txn = make_txn(&tm);
+        // other.txn_id != txn.txn_id, other is active → invisible
+        assert!(!txn.is_visible(other.txn_id, 0));
     }
 }

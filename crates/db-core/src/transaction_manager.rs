@@ -167,10 +167,10 @@ impl TransactionManager {
     /// Returns immediately if the transaction has already settled. Otherwise
     /// sleeps on a per-transaction condvar that is woken by commit/abort.
     ///
-    /// Lock ordering: this function never holds the waiters mutex while calling
-    /// is_active (which takes active_txns). commit/abort hold active_txns then
-    /// lock waiters in notify_waiters — so is_active must only be called
-    /// outside the waiters lock to avoid inversion.
+    /// Lock ordering: never hold the `waiters` mutex while calling `is_active`
+    /// (which locks `active_txns`). `commit`/`abort` lock `active_txns` and may
+    /// subsequently lock `waiters` when notifying, so keeping `is_active` calls
+    /// outside the `waiters` lock avoids potential lock-order inversion.
     pub fn wait_until_settled(&self, blocking_txn: u64) {
         // Fast path: already settled, nothing to do.
         if !self.is_active(blocking_txn) {

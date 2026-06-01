@@ -30,7 +30,7 @@ use std::sync::atomic::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::RwLock,
+    sync::{Arc, Condvar, Mutex, RwLock},
 };
 
 use crate::transaction::{Snapshot, Transaction};
@@ -55,11 +55,17 @@ pub enum TransactionStatus {
 ///    consistent point-in-time views.
 /// 3. **Commit Log (CLOG)**: Recording the final status of every transaction
 ///    to resolve visibility during record scans.
+//  Each entry is (settled: Mutex<bool>, Condvar). The condvar sleeps on its
+//  own mutex so wait_until_settled never holds the waiters map lock while
+//  sleeping — avoiding lock-order inversion with commit/abort.
+type WaiterEntry = Arc<(Mutex<bool>, Condvar)>;
+
 #[derive(Debug)]
 pub struct TransactionManager {
     pub next_txn_id: AtomicU64,
     pub clog: RwLock<HashMap<u64, TransactionStatus>>,
     pub active_txns: RwLock<HashSet<u64>>,
+    waiters: Mutex<HashMap<u64, WaiterEntry>>,
 }
 
 impl TransactionManager {
@@ -69,6 +75,7 @@ impl TransactionManager {
             next_txn_id: AtomicU64::new(1),
             clog: RwLock::new(HashMap::new()),
             active_txns: RwLock::new(HashSet::new()),
+            waiters: Mutex::new(HashMap::new()),
         }
     }
 
@@ -132,27 +139,79 @@ impl TransactionManager {
     /// Marks a transaction as committed in the CLOG and removes it from the active set.
     ///
     /// Once committed, the transaction's writes become eligible for visibility
-    /// to new snapshots.
+    /// to new snapshots. Any threads waiting on this transaction via
+    /// `wait_until_settled` are woken up.
     pub fn commit(&self, txn_id: u64) {
         self.clog
             .write()
             .unwrap()
             .insert(txn_id, TransactionStatus::Committed);
         self.active_txns.write().unwrap().remove(&txn_id);
+        self.notify_waiters(txn_id);
     }
 
     /// Marks a transaction as aborted in the CLOG and removes it from the active set.
     ///
-    /// **Note**: The caller (e.g., storage engine) is responsible for rolling back
-    /// any physical writes or undo logs associated with this transaction before
-    /// or after calling this method.
+    /// Any threads waiting on this transaction via `wait_until_settled` are woken up.
     pub fn abort(&self, txn_id: u64) {
-        // TODO: The storage/undo layer must rollback writes before calling this.
         self.clog
             .write()
             .unwrap()
             .insert(txn_id, TransactionStatus::Aborted);
         self.active_txns.write().unwrap().remove(&txn_id);
+        self.notify_waiters(txn_id);
+    }
+
+    /// Block the calling thread until `blocking_txn` commits or aborts.
+    ///
+    /// Returns immediately if the transaction has already settled. Otherwise
+    /// sleeps on a per-transaction condvar that is woken by commit/abort.
+    ///
+    /// Lock ordering: never hold the `waiters` mutex while calling `is_active`
+    /// (which locks `active_txns`). `commit`/`abort` lock `active_txns` and may
+    /// subsequently lock `waiters` when notifying, so keeping `is_active` calls
+    /// outside the `waiters` lock avoids potential lock-order inversion.
+    pub fn wait_until_settled(&self, blocking_txn: u64) {
+        // Fast path: already settled, nothing to do.
+        if !self.is_active(blocking_txn) {
+            return;
+        }
+
+        // Install the waiter entry. Do NOT call is_active while holding the
+        // waiters mutex — that acquires active_txns and inverts the lock order
+        // used by commit/abort (active_txns → waiters).
+        let entry: WaiterEntry = {
+            let mut waiters = self.waiters.lock().unwrap();
+            Arc::clone(
+                waiters
+                    .entry(blocking_txn)
+                    .or_insert_with(|| Arc::new((Mutex::new(false), Condvar::new()))),
+            )
+        }; // waiters lock released here — safe to call is_active again
+
+        // Missed-wakeup guard: the transaction may have settled between the
+        // fast-path check above and installing our entry. notify_waiters would
+        // have found no entry at that point and done nothing. Check now:
+        // - if settled is already true, wait_while returns immediately below
+        // - if is_active is false but settled not yet true, clean up and return
+        if !self.is_active(blocking_txn) {
+            self.notify_waiters(blocking_txn);
+            return;
+        }
+
+        // Sleep on the entry's own mutex — no map lock held during the wait.
+        let (settled_lock, cv) = &*entry;
+        let settled = settled_lock.lock().unwrap();
+        drop(cv.wait_while(settled, |s| !*s).unwrap());
+    }
+
+    fn notify_waiters(&self, txn_id: u64) {
+        let entry = self.waiters.lock().unwrap().remove(&txn_id);
+        if let Some(entry) = entry {
+            let (settled_lock, cv) = &*entry;
+            *settled_lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
     }
 
     /// Returns `true` if the transaction is recorded as `Committed` in the CLOG.
@@ -273,5 +332,144 @@ mod tests {
         assert!(snap.active.contains(&txn1.txn_id));
         assert!(snap.active.contains(&txn3.txn_id));
         assert_eq!(snap.active.len(), 2);
+    }
+
+    // ── wait_until_settled ────────────────────────────────────────────────
+
+    #[test]
+    fn wait_until_settled_returns_immediately_if_already_committed() {
+        let tm = std::sync::Arc::new(TransactionManager::new());
+        let txn = tm.begin();
+        tm.commit(txn.txn_id);
+        // Must return without blocking — transaction already settled.
+        tm.wait_until_settled(txn.txn_id);
+    }
+
+    #[test]
+    fn wait_until_settled_returns_immediately_if_already_aborted() {
+        let tm = std::sync::Arc::new(TransactionManager::new());
+        let txn = tm.begin();
+        tm.abort(txn.txn_id);
+        tm.wait_until_settled(txn.txn_id);
+    }
+
+    #[test]
+    fn wait_until_settled_unblocks_on_commit() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let tm = Arc::new(TransactionManager::new());
+        let blocker = tm.begin();
+        let blocker_id = blocker.txn_id;
+
+        let tm_clone = Arc::clone(&tm);
+        let waiter = thread::spawn(move || {
+            tm_clone.wait_until_settled(blocker_id);
+        });
+
+        // Give the waiter thread time to reach wait_until_settled and sleep.
+        thread::sleep(Duration::from_millis(20));
+        assert!(!waiter.is_finished(), "waiter should be blocked");
+
+        tm.commit(blocker_id);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !waiter.is_finished() {
+            assert!(Instant::now() < deadline, "waiter did not unblock after commit");
+            thread::sleep(Duration::from_millis(5));
+        }
+        waiter.join().expect("waiter panicked");
+    }
+
+    #[test]
+    fn wait_until_settled_unblocks_on_abort() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let tm = Arc::new(TransactionManager::new());
+        let blocker = tm.begin();
+        let blocker_id = blocker.txn_id;
+
+        let tm_clone = Arc::clone(&tm);
+        let waiter = thread::spawn(move || {
+            tm_clone.wait_until_settled(blocker_id);
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        assert!(!waiter.is_finished(), "waiter should be blocked");
+
+        tm.abort(blocker_id);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !waiter.is_finished() {
+            assert!(Instant::now() < deadline, "waiter did not unblock after abort");
+            thread::sleep(Duration::from_millis(5));
+        }
+        waiter.join().expect("waiter panicked");
+    }
+
+    #[test]
+    fn wait_until_settled_multiple_waiters_all_unblock() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let tm = Arc::new(TransactionManager::new());
+        let blocker = tm.begin();
+        let blocker_id = blocker.txn_id;
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let tm_clone = Arc::clone(&tm);
+                thread::spawn(move || {
+                    tm_clone.wait_until_settled(blocker_id);
+                })
+            })
+            .collect();
+
+        thread::sleep(Duration::from_millis(20));
+        tm.commit(blocker_id);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for handle in handles {
+            while !handle.is_finished() {
+                assert!(Instant::now() < deadline, "a waiter did not unblock");
+                thread::sleep(Duration::from_millis(5));
+            }
+            handle.join().expect("waiter panicked");
+        }
+    }
+
+    #[test]
+    fn waiter_map_cleaned_up_after_settle() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let tm = Arc::new(TransactionManager::new());
+        let blocker = tm.begin();
+        let blocker_id = blocker.txn_id;
+
+        let tm_clone = Arc::clone(&tm);
+        let waiter = thread::spawn(move || {
+            tm_clone.wait_until_settled(blocker_id);
+        });
+
+        // Give the waiter time to register its entry in the map.
+        thread::sleep(Duration::from_millis(20));
+
+        tm.commit(blocker_id);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !waiter.is_finished() {
+            assert!(Instant::now() < deadline, "waiter did not unblock");
+            thread::sleep(Duration::from_millis(5));
+        }
+        waiter.join().expect("waiter panicked");
+
+        // Entry must be removed from the map after settle — no memory leak.
+        assert!(!tm.waiters.lock().unwrap().contains_key(&blocker_id));
     }
 }

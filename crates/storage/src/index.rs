@@ -279,35 +279,47 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
         };
 
-        // Exclusive latch + rightlink correction.
+        // Exclusive latch + rightlink correction + conflict retry loop.
         let mut leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
         loop {
+            // Rightlink correction: follow splits that happened during descent.
+            loop {
+                let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+                if let Some(hk) = acc.high_key_bytes() {
+                    if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
+                        let right = acc.rightlink().unwrap();
+                        drop(leaf_guard);
+                        leaf_guard = self.pool.fetch_page_mut(right)?;
+                        continue;
+                    }
+                }
+                break;
+            }
+
+            // Find visible version.
             let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-            if let Some(hk) = acc.high_key_bytes() {
-                if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
-                    let right = acc.rightlink().unwrap();
+            let visible_slot = self
+                .find_visible_slot(&acc, key, txn)
+                .ok_or(IndexError::KeyNotFound)?;
+
+            // Conflict check: if another in-progress txn holds xmax, wait for
+            // it to settle then retry — same Wait-Die protocol as insert.
+            let rec_xmax = acc.get_xmax(visible_slot);
+            match self.check_write_conflict(rec_xmax, txn) {
+                Ok(()) => {}
+                Err(IndexError::WaitFor(blocking_txn)) => {
                     drop(leaf_guard);
-                    leaf_guard = self.pool.fetch_page_mut(right)?;
+                    Self::wait_for_txn(&txn.tm, blocking_txn, txn.txn_id)?;
+                    leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
                     continue;
                 }
+                Err(e) => return Err(e),
             }
-            break;
+
+            // Set xmax to mark this version as deleted by our transaction.
+            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
+            return Ok(());
         }
-
-        // Find visible version.
-        let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-        let visible_slot = self
-            .find_visible_slot(&acc, key, txn)
-            .ok_or(IndexError::KeyNotFound)?;
-
-        // Conflict check: has another in-progress txn already set xmax?
-        let rec_xmax = acc.get_xmax(visible_slot);
-        self.check_write_conflict(rec_xmax, txn)?;
-
-        // Set xmax to mark this version as deleted by our transaction.
-        LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
-
-        Ok(())
     }
 
     /// Update `key` with `new_value`. Atomically sets xmax on the old version
@@ -364,46 +376,57 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
         };
 
-        // Exclusive latch + rightlink correction.
+        // Exclusive latch + rightlink correction + conflict retry loop.
         let mut leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
         loop {
+            // Rightlink correction: follow splits that happened during descent.
+            loop {
+                let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+                if let Some(hk) = acc.high_key_bytes() {
+                    if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
+                        let right = acc.rightlink().unwrap();
+                        drop(leaf_guard);
+                        leaf_guard = self.pool.fetch_page_mut(right)?;
+                        continue;
+                    }
+                }
+                break;
+            }
+
+            // Find visible version under same exclusive latch.
             let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-            if let Some(hk) = acc.high_key_bytes() {
-                if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
-                    let right = acc.rightlink().unwrap();
+            let visible_slot = self
+                .find_visible_slot(&acc, key, txn)
+                .ok_or(IndexError::KeyNotFound)?;
+
+            // Conflict check: if another in-progress txn holds xmax, wait for
+            // it to settle then retry — same Wait-Die protocol as insert.
+            let rec_xmax = acc.get_xmax(visible_slot);
+            match self.check_write_conflict(rec_xmax, txn) {
+                Ok(()) => {}
+                Err(IndexError::WaitFor(blocking_txn)) => {
                     drop(leaf_guard);
-                    leaf_guard = self.pool.fetch_page_mut(right)?;
+                    Self::wait_for_txn(&txn.tm, blocking_txn, txn.txn_id)?;
+                    leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
                     continue;
                 }
+                Err(e) => return Err(e),
             }
-            break;
-        }
 
-        // Find visible version under same exclusive latch.
-        let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-        let visible_slot = self
-            .find_visible_slot(&acc, key, txn)
-            .ok_or(IndexError::KeyNotFound)?;
+            // ── ATOMIC: set xmax on old + insert new (same latch) ────────────
+            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
 
-        // Conflict check.
-        let rec_xmax = acc.get_xmax(visible_slot);
-        self.check_write_conflict(rec_xmax, txn)?;
+            // Find insert position for the new version.
+            let (slot, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
+            let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(slot, key, value);
 
-        // ── ATOMIC: set xmax on old + insert new (same latch) ────────────
-        LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
-
-        // Find insert position for the new version.
-        let (slot, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
-        let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(slot, key, value);
-
-        match result {
-            Ok(()) => {
-                LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
-                return Ok(());
-            }
-            Err(_) => {
-                return self.split_and_insert(leaf_guard, key, value, txn.txn_id, &mut stack);
-            }
+            return match result {
+                Ok(()) => {
+                    LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
+                    Ok(())
+                }
+                Err(_) => self.split_and_insert(leaf_guard, key, value, txn.txn_id, &mut stack),
+            };
         }
     }
 
@@ -568,21 +591,26 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
     /// Wait for `blocking_txn` to settle using Wait-Die deadlock prevention.
     ///
     /// If the caller is younger than the blocker (higher txn_id), it dies
-    /// immediately rather than waiting — this prevents circular waits where
-    /// two transactions spin on each other across different keys.
+    /// immediately — this prevents circular waits where two transactions
+    /// wait on each other across different keys.
+    ///
+    /// If the caller is older, it sleeps on a condvar until the blocker
+    /// commits or aborts, then returns so the caller can retry.
     ///
     /// Must be called with no page latches held.
     fn wait_for_txn(tm: &TransactionManager, blocking_txn: u64, my_txn_id: u64) -> Result<()> {
         if my_txn_id > blocking_txn {
             return Err(IndexError::WriteConflict);
         }
-        while tm.is_active(blocking_txn) {
-            std::hint::spin_loop();
-        }
+        tm.wait_until_settled(blocking_txn);
         Ok(())
     }
 
-    /// First-writer-wins conflict check before setting xmax on a record.
+    /// Conflict check before setting xmax on a record.
+    ///
+    /// Returns `WaitFor(txn_id)` if another in-progress transaction has already
+    /// claimed this version — the caller must drop its latch, wait for the
+    /// blocker to settle, then retry (same pattern as insert).
     fn check_write_conflict(&self, rec_xmax: u64, txn: &Transaction) -> Result<()> {
         if rec_xmax == 0 {
             return Ok(()); // nobody has touched this version
@@ -591,8 +619,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             return Ok(()); // we already modified it (re-entrant)
         }
         if txn.is_in_progress(rec_xmax) {
-            // Another active txn claimed this version → first writer wins → we lose.
-            return Err(IndexError::WriteConflict);
+            return Err(IndexError::WaitFor(rec_xmax));
         }
         // The modifier committed → version is already dead.
         // Caller will get KeyNotFound since find_visible_slot won't find it.

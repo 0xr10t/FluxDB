@@ -116,6 +116,11 @@ pub enum IndexError {
     /// drop its page latch, wait for `txn_id` to settle, then retry.
     #[error("Wait for transaction {0}")]
     WaitFor(u64),
+
+    /// The metadata/superblock page (page 0) is missing, has the wrong magic,
+    /// or an unrecognised format version — the file is not a readable database.
+    #[error("Corrupt or invalid metadata page: {0}")]
+    CorruptMetadata(String),
 }
 
 // ==== TYPE NAME ERRORS =============================================================

@@ -188,6 +188,96 @@ fn test_checksum_detects_corruption() {
 }
 
 #[test]
+fn test_concurrent_fetch_valid_page() {
+    // Many threads fetching the same valid page concurrently must all succeed and
+    // see the same bytes. Exercises the loading-state coordination in
+    // `acquire_frame`: exactly one thread loads, the rest wait then read.
+    use std::thread;
+    const N: usize = 8; // <= shard frame count, so the load race can't exhaust frames
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("concurrent_valid.db");
+    let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+
+    let pid;
+    {
+        let bpm = BufferPoolManager::new(disk_manager.clone());
+        let mut page = bpm.new_page().unwrap();
+        pid = page.page_id;
+        page[0] = crate::page::LEAF;
+        page[100] = 7;
+        drop(page);
+        bpm.flush_page(pid).unwrap();
+    }
+
+    // Fresh pool → the page must be loaded from disk; N threads race that load.
+    let bpm = Arc::new(BufferPoolManager::new(disk_manager));
+    let mut handles = Vec::new();
+    for _ in 0..N {
+        let bpm = bpm.clone();
+        handles.push(thread::spawn(move || {
+            let page = bpm.fetch_page(pid).unwrap();
+            assert_eq!(page[0], crate::page::LEAF);
+            assert_eq!(page[100], 7);
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+#[test]
+fn test_concurrent_fetch_corrupt_page() {
+    // The race the loading-state fix targets: while one thread loads a page that
+    // will FAIL verification, other threads must NOT be handed the frame. Every
+    // thread fetching the corrupt page must observe PageCorruption — never a
+    // successful guard over unverified bytes, and never a panic.
+    use common::BufferPoolError;
+    use std::thread;
+    const N: usize = 8;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("concurrent_corrupt.db");
+    let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+
+    let pid;
+    {
+        let bpm = BufferPoolManager::new(disk_manager.clone());
+        let mut page = bpm.new_page().unwrap();
+        pid = page.page_id;
+        page[0] = crate::page::LEAF;
+        page[100] = 7;
+        drop(page);
+        bpm.flush_page(pid).unwrap();
+    }
+
+    // Corrupt a data byte on disk, bypassing the checksum-stamping flush path.
+    let mut raw = vec![0u8; MAX_PAGE_SIZE];
+    disk_manager.read_page(pid, &mut raw).unwrap();
+    raw[100] ^= 0xFF;
+    disk_manager.write_page(pid, &raw).unwrap();
+    disk_manager.sync_data().unwrap();
+
+    let bpm = Arc::new(BufferPoolManager::new(disk_manager));
+    let mut handles = Vec::new();
+    for _ in 0..N {
+        let bpm = bpm.clone();
+        handles.push(thread::spawn(move || {
+            matches!(
+                bpm.fetch_page(pid),
+                Err(BufferPoolError::PageCorruption { .. })
+            )
+        }));
+    }
+    for h in handles {
+        assert!(
+            h.join().unwrap(),
+            "a thread observed something other than PageCorruption"
+        );
+    }
+}
+
+#[test]
 fn test_buffer_pool_manager_pin_count() {
     use common::BufferPoolError;
     let dir = tempdir().unwrap();

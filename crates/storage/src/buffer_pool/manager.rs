@@ -61,10 +61,15 @@ impl BufferPoolManager {
         };
 
         let shard = self.get_shard(page_id);
-        let (frame_id, _) = shard.evict_and_replace(page_id)?;
+        // A freshly allocated page id is unique, so this is always a miss
+        // (needs_load = true): the frame is published in the loading state.
+        let (frame_id, _needs_load) = shard.acquire_frame(page_id)?;
 
         let mut data = shard.pages[frame_id].write().unwrap();
         data.fill(0);
+        // No disk read for a brand-new page; mark the frame ready (still holding
+        // the write guard — page→inner lock order is safe).
+        shard.finish_load(page_id, frame_id, true);
 
         Ok(PageWriteGuard {
             shard,
@@ -88,31 +93,34 @@ impl BufferPoolManager {
         self.check_page_id(page_id)?;
         let shard = self.get_shard(page_id);
 
-        if let Some(frame_id) = shard.pin_page(page_id) {
-            let data = shard.pages[frame_id].read().unwrap();
-            return Ok(PageReadGuard {
-                shard,
-                page_id,
-                guard: Some(data),
-            });
-        }
-
-        let (frame_id, needs_load) = shard.evict_and_replace(page_id)?;
+        let (frame_id, needs_load) = shard.acquire_frame(page_id)?;
 
         if needs_load {
-            let mut data = shard.pages[frame_id].write().unwrap();
-            shard
-                .disk_manager
-                .read_page(page_id, data.0.as_mut())?;
-            if let Err((expected, actual)) = crate::page::verify_checksum(&data[..]) {
-                drop(data); // drop is called to free the bytes for use by other thread. 
-                shard.discard_frame(page_id);
-                return Err(BufferPoolError::PageCorruption {
-                    page_id,
-                    expected,
-                    actual,
-                });
+            // Load + verify under the frame write lock. The mapping is published
+            // in the `loading` state, so other threads wait rather than observe
+            // these bytes before verification.
+            let load = {
+                let mut data = shard.pages[frame_id].write().unwrap();
+                shard
+                    .disk_manager
+                    .read_page(page_id, data.0.as_mut())
+                    .map_err(BufferPoolError::from)
+                    .and_then(|()| {
+                        crate::page::verify_checksum(&data[..]).map_err(|(expected, actual)| {
+                            BufferPoolError::PageCorruption {
+                                page_id,
+                                expected,
+                                actual,
+                            }
+                        })
+                    })
+            }; // write guard dropped here
+
+            if let Err(e) = load {
+                shard.finish_load(page_id, frame_id, false);
+                return Err(e);
             }
+            shard.finish_load(page_id, frame_id, true);
         }
 
         let data = shard.pages[frame_id].read().unwrap();
@@ -137,31 +145,35 @@ impl BufferPoolManager {
         self.check_page_id(page_id)?;
         let shard = self.get_shard(page_id);
 
-        if let Some(frame_id) = shard.pin_page(page_id) {
-            let data = shard.pages[frame_id].write().unwrap();
-            return Ok(PageWriteGuard {
-                shard,
-                page_id,
-                guard: Some(data),
-                dirty: false,
-            });
-        }
+        let (frame_id, needs_load) = shard.acquire_frame(page_id)?;
 
-        let (frame_id, needs_load) = shard.evict_and_replace(page_id)?;
-
+        // Hold the write guard across the load so we can hand it straight back on
+        // success without a re-lock window.
         let mut data = shard.pages[frame_id].write().unwrap();
         if needs_load {
-            shard
+            let load = shard
                 .disk_manager
-                .read_page(page_id, data.0.as_mut())?;
-            if let Err((expected, actual)) = crate::page::verify_checksum(&data[..]) {
-                drop(data);
-                shard.discard_frame(page_id);
-                return Err(BufferPoolError::PageCorruption {
-                    page_id,
-                    expected,
-                    actual,
+                .read_page(page_id, data.0.as_mut())
+                .map_err(BufferPoolError::from)
+                .and_then(|()| {
+                    crate::page::verify_checksum(&data[..]).map_err(|(expected, actual)| {
+                        BufferPoolError::PageCorruption {
+                            page_id,
+                            expected,
+                            actual,
+                        }
+                    })
                 });
+
+            match load {
+                // Still holding `data` (page write lock) while finish_load takes
+                // the inner lock — page→inner order is deadlock-free.
+                Ok(()) => shard.finish_load(page_id, frame_id, true),
+                Err(e) => {
+                    drop(data);
+                    shard.finish_load(page_id, frame_id, false);
+                    return Err(e);
+                }
             }
         }
 

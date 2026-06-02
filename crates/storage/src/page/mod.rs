@@ -8,7 +8,7 @@
 
 pub mod internal;
 pub mod leaf;
-
+pub mod meta;
 pub use internal::{InternalPageAccessor, InternalPageBuilder, InternalPageMutator};
 pub use leaf::{LeafPageAccessor, LeafPageBuilder, LeafPageMutator};
 
@@ -26,7 +26,8 @@ pub type SlotId = u16;
 pub const LEAF: u8 = 1;
 /// Marker byte stored at offset 0 of every internal page.
 pub const INTERNAL: u8 = 2;
-
+/// Marker byte stored at offset 0 of metadata page
+pub const META: u8 = 3;
 // ── Page size ─────────────────────────────────────────────────────────────────
 
 /// Canonical page size used throughout the storage engine (4 KB).
@@ -44,7 +45,8 @@ const CHECKSUM_LEN: usize = 4;
 const OFF_LEAF_CHECKSUM: usize = 44;
 /// Checksum offset for an internal page (first word of the fixed header).
 const OFF_INT_CHECKSUM: usize = 32;
-
+/// checksum offset for metadata page
+const OFF_META_CHECKSUM: usize = 56;
 /// Byte offset of the CRC32 field for the given page-type marker, or `None` for
 /// an unrecognised type (e.g. a never-initialised, all-zero page) which carries
 /// no checksum to verify.
@@ -53,6 +55,7 @@ fn checksum_offset(page_type: u8) -> Option<usize> {
     match page_type {
         LEAF => Some(OFF_LEAF_CHECKSUM),
         INTERNAL => Some(OFF_INT_CHECKSUM),
+        META => Some(OFF_META_CHECKSUM),
         _ => None,
     }
 }

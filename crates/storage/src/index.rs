@@ -58,11 +58,11 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         // write surfaces here as BufferPoolError::PageCorruption.
         let meta = pool.fetch_page(0)?;
         let root = crate::page::meta::read_root(&meta[..]).ok_or_else(|| {
-          IndexError::CorruptMetadata("page 0 is not a FluxDB superblock".into())
+            IndexError::CorruptMetadata("page 0 is not a FluxDB superblock".into())
         })?;
         drop(meta);
         Ok(Self::from_root(pool, root))
-  }  
+    }
 
     /// Reclaims storage space by physically removing dead record versions.
     ///
@@ -101,8 +101,8 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         let mut meta_guard = pool.new_page()?;
         let meta_pid = meta_guard.page_id;
         // create root page first
-        let mut root_guard = pool.new_page()?; 
-        let root_pid = root_guard.page_id; 
+        let mut root_guard = pool.new_page()?;
+        let root_pid = root_guard.page_id;
         LeafPageBuilder::<K, V>::new(root_pid, &mut root_guard[..]);
         drop(root_guard);
         // Make the root durable BEFORE the superblock that points to it, so a
@@ -110,7 +110,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         pool.flush_page(root_pid)?;
         crate::page::meta::init(&mut meta_guard[..], root_pid);
         drop(meta_guard);
-        pool.flush_page(meta_pid)?; 
+        pool.flush_page(meta_pid)?;
 
         Ok((Self::from_root(pool, root_pid), root_pid))
     }
@@ -124,7 +124,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             pool,
             root: Mutex::new(root),
             _val: PhantomData,
-            _key: PhantomData
+            _key: PhantomData,
         }
     }
 
@@ -883,11 +883,11 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 *self.root.lock().unwrap() = new_root_pid;
                 // updating new root in metadata page
                 {
-                    let mut meta = self.pool.fetch_page_mut(0)?; 
-                    //TODO: Integrate this with WAL later 
+                    let mut meta = self.pool.fetch_page_mut(0)?;
+                    //TODO: Integrate this with WAL later
                     crate::page::meta::set_root(&mut meta[..], new_root_pid);
                 } // drops the meta guard before flush_page(0)
-                self.pool.flush_page(0)?; 
+                self.pool.flush_page(0)?;
                 return Ok(());
             }
 
@@ -1218,7 +1218,11 @@ mod tests {
             let key = leak_bytes(&k.to_be_bytes());
             let expected = (k * 7).to_be_bytes();
             let got = index.get(&key, &auto()).unwrap();
-            assert_eq!(got.as_deref(), Some(&expected[..]), "key {k} wrong after reopen");
+            assert_eq!(
+                got.as_deref(),
+                Some(&expected[..]),
+                "key {k} wrong after reopen"
+            );
         }
     }
 

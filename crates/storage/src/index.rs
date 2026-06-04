@@ -119,13 +119,13 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         let mut page = self.pool.fetch_page(leaf_pid)?;
         loop {
             let acc = LeafPageAccessor::<K, V>::new(&page[..]);
-            if let Some(hk) = acc.high_key_bytes() {
-                if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
-                    let right = acc.rightlink().unwrap();
-                    drop(page);
-                    page = self.pool.fetch_page(right)?;
-                    continue;
-                }
+            if let Some(hk) = acc.high_key_bytes()
+                && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
+            {
+                let right = acc.rightlink().unwrap();
+                drop(page);
+                page = self.pool.fetch_page(right)?;
+                continue;
             }
             break;
         }
@@ -168,13 +168,13 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             match page[0] {
                 INTERNAL => {
                     let acc = InternalPageAccessor::<K>::new(&page[..]);
-                    if let Some(hk) = acc.high_key_bytes() {
-                        if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
-                            let right = acc.rightlink().unwrap();
-                            drop(page);
-                            pid = right;
-                            continue;
-                        }
+                    if let Some(hk) = acc.high_key_bytes()
+                        && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
+                    {
+                        let right = acc.rightlink().unwrap();
+                        drop(page);
+                        pid = right;
+                        continue;
                     }
                     let (_, child_pid) = acc.find_child(key);
                     stack.push(BTStackEntry { page_id: pid });
@@ -204,13 +204,13 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             // Rightlink correction: follow splits that happened during descent.
             loop {
                 let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-                if let Some(hk) = acc.high_key_bytes() {
-                    if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
-                        let right = acc.rightlink().unwrap();
-                        drop(leaf_guard);
-                        leaf_guard = self.pool.fetch_page_mut(right)?;
-                        continue;
-                    }
+                if let Some(hk) = acc.high_key_bytes()
+                    && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
+                {
+                    let right = acc.rightlink().unwrap();
+                    drop(leaf_guard);
+                    leaf_guard = self.pool.fetch_page_mut(right)?;
+                    continue;
                 }
                 break;
             }
@@ -254,13 +254,13 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             match page[0] {
                 INTERNAL => {
                     let acc = InternalPageAccessor::<K>::new(&page[..]);
-                    if let Some(hk) = acc.high_key_bytes() {
-                        if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
-                            let right = acc.rightlink().unwrap();
-                            drop(page);
-                            pid = right;
-                            continue;
-                        }
+                    if let Some(hk) = acc.high_key_bytes()
+                        && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
+                    {
+                        let right = acc.rightlink().unwrap();
+                        drop(page);
+                        pid = right;
+                        continue;
                     }
                     let (_, child_pid) = acc.find_child(key);
                     drop(page);
@@ -285,13 +285,13 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             // Rightlink correction: follow splits that happened during descent.
             loop {
                 let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-                if let Some(hk) = acc.high_key_bytes() {
-                    if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
-                        let right = acc.rightlink().unwrap();
-                        drop(leaf_guard);
-                        leaf_guard = self.pool.fetch_page_mut(right)?;
-                        continue;
-                    }
+                if let Some(hk) = acc.high_key_bytes()
+                    && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
+                {
+                    let right = acc.rightlink().unwrap();
+                    drop(leaf_guard);
+                    leaf_guard = self.pool.fetch_page_mut(right)?;
+                    continue;
                 }
                 break;
             }
@@ -350,13 +350,13 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             match page[0] {
                 INTERNAL => {
                     let acc = InternalPageAccessor::<K>::new(&page[..]);
-                    if let Some(hk) = acc.high_key_bytes() {
-                        if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
-                            let right = acc.rightlink().unwrap();
-                            drop(page);
-                            pid = right;
-                            continue;
-                        }
+                    if let Some(hk) = acc.high_key_bytes()
+                        && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
+                    {
+                        let right = acc.rightlink().unwrap();
+                        drop(page);
+                        pid = right;
+                        continue;
                     }
                     let (_, child_pid) = acc.find_child(key);
                     stack.push(BTStackEntry { page_id: pid });
@@ -382,13 +382,13 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             // Rightlink correction: follow splits that happened during descent.
             loop {
                 let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-                if let Some(hk) = acc.high_key_bytes() {
-                    if K::compare(key_bytes.as_ref(), hk) != Ordering::Less {
-                        let right = acc.rightlink().unwrap();
-                        drop(leaf_guard);
-                        leaf_guard = self.pool.fetch_page_mut(right)?;
-                        continue;
-                    }
+                if let Some(hk) = acc.high_key_bytes()
+                    && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
+                {
+                    let right = acc.rightlink().unwrap();
+                    drop(leaf_guard);
+                    leaf_guard = self.pool.fetch_page_mut(right)?;
+                    continue;
                 }
                 break;
             }
@@ -869,14 +869,14 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             let mut parent_guard = self.pool.fetch_page_mut(parent_pid)?;
             loop {
                 let acc = InternalPageAccessor::<K>::new(&parent_guard[..]);
-                if let Some(hk) = acc.high_key_bytes() {
-                    if K::compare(&sep_key, hk) != Ordering::Less {
-                        let right = acc.rightlink().unwrap();
-                        drop(parent_guard);
-                        parent_pid = right;
-                        parent_guard = self.pool.fetch_page_mut(parent_pid)?;
-                        continue;
-                    }
+                if let Some(hk) = acc.high_key_bytes()
+                    && K::compare(&sep_key, hk) != Ordering::Less
+                {
+                    let right = acc.rightlink().unwrap();
+                    drop(parent_guard);
+                    parent_pid = right;
+                    parent_guard = self.pool.fetch_page_mut(parent_pid)?;
+                    continue;
                 }
                 break;
             }

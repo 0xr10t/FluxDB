@@ -41,6 +41,9 @@ pub enum WalError {
 
     #[error("Invalid LSN")]
     InvalidLsn,
+
+    #[error("Disk error: {0}")]
+    Disk(#[from] DiskError),
 }
 
 // ==== PAGE ERRORS =============================================================

@@ -229,7 +229,7 @@ impl Wal {
 
     pub fn flush(&mut self) -> Result<()> {
         self.file.flush()?;
-        DiskManager::sync_file_and_dir(self.file.get_ref(), &self.path);
+        DiskManager::sync_file_and_dir(self.file.get_ref(), &self.path)?;
         Ok(())
     }
 }

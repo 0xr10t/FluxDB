@@ -22,7 +22,7 @@ pub type Result<T> = std::result::Result<T, DiskError>;
 /// This layer handles low-level page I/O, ensuring that data is correctly
 /// read from and written to the underlying storage medium.
 pub struct DiskManager {
-    db_path: PathBuf,
+    _db_path: PathBuf,
     file: File,
     page_size: usize,
 }
@@ -39,7 +39,7 @@ impl DiskManager {
             .open(&path)?;
 
         Ok(Self {
-            db_path: path.as_ref().to_path_buf(),
+            _db_path: path.as_ref().to_path_buf(),
             file,
             page_size,
         })

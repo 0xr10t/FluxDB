@@ -17,6 +17,12 @@ type Result<T> = std::result::Result<T, BufferPoolError>;
 /// A fixed-size buffer for a single database page.
 pub struct PageData(pub Box<[u8; MAX_PAGE_SIZE]>);
 
+impl Default for PageData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PageData {
     /// Creates a new, zeroed `PageData`.
     pub fn new() -> Self {
@@ -323,7 +329,7 @@ impl BufferPoolShard {
                 if meta.pin_count == 0 {
                     inner.replacer.unpin(frame_id);
                 }
-                if let Err(_) = res {
+                if res.is_err() {
                     inner.metadata[frame_id].is_dirty = true;
                     return Err(BufferPoolError::InternalError(
                         "Flush failed during delete".to_string(),

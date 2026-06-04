@@ -68,6 +68,12 @@ pub struct TransactionManager {
     waiters: Mutex<HashMap<u64, WaiterEntry>>,
 }
 
+impl Default for TransactionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TransactionManager {
     /// Creates a new, empty `TransactionManager`.
     pub fn new() -> Self {
@@ -376,7 +382,10 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while !waiter.is_finished() {
-            assert!(Instant::now() < deadline, "waiter did not unblock after commit");
+            assert!(
+                Instant::now() < deadline,
+                "waiter did not unblock after commit"
+            );
             thread::sleep(Duration::from_millis(5));
         }
         waiter.join().expect("waiter panicked");
@@ -404,7 +413,10 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while !waiter.is_finished() {
-            assert!(Instant::now() < deadline, "waiter did not unblock after abort");
+            assert!(
+                Instant::now() < deadline,
+                "waiter did not unblock after abort"
+            );
             thread::sleep(Duration::from_millis(5));
         }
         waiter.join().expect("waiter panicked");

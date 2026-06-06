@@ -10,7 +10,7 @@ use common::BufferPoolError;
 use common::{INVALID_FRAME_ID, MAX_PAGE_SIZE};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 type Result<T> = std::result::Result<T, BufferPoolError>;
 
@@ -116,6 +116,7 @@ pub struct FrameMetadata {
     pub page_id: u64,
     pub pin_count: u64,
     pub is_dirty: bool,
+    pub loading: bool, // true while a load is in flight; frame not usable yet
 }
 
 /// Internal state of a buffer pool shard, protected by a mutex.
@@ -131,6 +132,7 @@ pub struct BufferPoolShard {
     pub disk_manager: Arc<DiskManager>,
     pub pages: Vec<RwLock<PageData>>,
     pub inner: Mutex<ShardInner>,
+    pub load_done: Condvar, // singalled when any load finishes(success or fail)
 }
 
 impl BufferPoolShard {
@@ -143,6 +145,7 @@ impl BufferPoolShard {
                 page_id: INVALID_FRAME_ID,
                 pin_count: 0,
                 is_dirty: false,
+                loading: false,
             });
             free_list.push(size - 1 - frame_id);
         }
@@ -156,6 +159,7 @@ impl BufferPoolShard {
                 free_list,
                 replacer: ClockReplacer::new(size),
             }),
+            load_done: Condvar::new(),
         }
     }
 
@@ -174,18 +178,6 @@ impl BufferPoolShard {
         }
     }
 
-    /// Increments the pin count of a page and notifies the replacer.
-    pub fn pin_page(&self, page_id: u64) -> Option<usize> {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(&frame_id) = inner.page_table.get(&page_id) {
-            inner.metadata[frame_id].pin_count += 1;
-            inner.replacer.pin(frame_id);
-            Some(frame_id)
-        } else {
-            None
-        }
-    }
-
     pub fn find_victim_frame_id(&self, inner: &mut ShardInner) -> Result<usize> {
         if let Some(id) = inner.free_list.pop() {
             Ok(id)
@@ -194,33 +186,42 @@ impl BufferPoolShard {
         }
     }
 
-    /// Finds an evictable frame and replaces its content with a new page.
+    /// Acquire a frame for `page_id`.
     ///
-    /// If the evicted page is dirty, it is flushed to disk first.
+    /// Returns `(frame_id, needs_load)`:
+    /// - `false`: the page is resident and fully loaded; the frame is pinned and
+    ///   ready to use.
+    /// - `true`: the frame is reserved and published in a **loading** state; the
+    ///   caller MUST load `page_id` into it and then call [`finish_load`]. Other
+    ///   threads wanting this page block until then, so a page is never
+    ///   observable before it has been loaded and verified.
     ///
     /// # Errors
     ///
     /// * Returns [`BufferPoolError::NoEvictableFrames`] if no frames can be evicted.
     /// * Returns [`BufferPoolError::InternalError`] if a disk I/O error occurs.
-    pub fn evict_and_replace(&self, page_id: u64) -> Result<(usize, bool)> {
+    pub fn acquire_frame(&self, page_id: u64) -> Result<(usize, bool)> {
+        let mut inner = self.inner.lock().unwrap();
         loop {
-            let mut inner = self.inner.lock().unwrap();
-
-            if let Some(&local_id) = inner.page_table.get(&page_id) {
-                inner.metadata[local_id].pin_count += 1;
-                inner.replacer.pin(local_id);
-                return Ok((local_id, false));
+            if let Some(&frame_id) = inner.page_table.get(&page_id) {
+                if inner.metadata[frame_id].loading {
+                    inner = self.load_done.wait(inner).unwrap(); // wait then re-check
+                    continue;
+                }
+                // load cleared path, this is the path when load succeeded
+                inner.metadata[frame_id].pin_count += 1;
+                inner.replacer.pin(frame_id);
+                return Ok((frame_id, false));
             }
-
             let frame_id = self.find_victim_frame_id(&mut inner)?;
-            let meta = &inner.metadata[frame_id];
-            let old_page_id = meta.page_id;
-            let is_dirty = meta.is_dirty;
+            let old_page_id = inner.metadata[frame_id].page_id;
+            let is_dirty = inner.metadata[frame_id].is_dirty;
 
             if is_dirty && old_page_id != INVALID_FRAME_ID {
                 drop(inner);
                 self.flush_page(old_page_id)?;
-                continue;
+                inner = self.inner.lock().unwrap();
+                continue; // need to re-check the table now as someone might have loaded this frame while we were flushing 
             }
 
             if old_page_id != INVALID_FRAME_ID {
@@ -231,14 +232,32 @@ impl BufferPoolShard {
             meta.page_id = page_id;
             meta.pin_count = 1;
             meta.is_dirty = false;
+            meta.loading = true;
 
             inner.page_table.insert(page_id, frame_id);
             inner.replacer.pin(frame_id);
-
             return Ok((frame_id, true));
         }
     }
 
+    pub fn finish_load(&self, page_id: u64, frame_id: usize, success: bool) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if success {
+                inner.metadata[frame_id].loading = false;
+            } else {
+                inner.page_table.remove(&page_id);
+                let meta = &mut inner.metadata[frame_id];
+                meta.page_id = INVALID_FRAME_ID;
+                meta.pin_count = 0;
+                meta.is_dirty = false;
+                meta.loading = false;
+                inner.replacer.pin(frame_id);
+                inner.free_list.push(frame_id);
+            }
+        }
+        self.load_done.notify_all();
+    }
     /// Flushes a specific page to disk if it is dirty.
     ///
     /// # Errors
@@ -298,6 +317,9 @@ impl BufferPoolShard {
             let data = self.pages[frame_id].read().unwrap();
             buf.copy_from_slice(&data[..]);
         }
+
+        // Stamp the CRC32 on the outgoing copy so corruption is detectable on the next load
+        crate::page::stamp_checksum(&mut buf);
 
         self.disk_manager.write_page(page_id, &buf)?;
         self.disk_manager.sync_data()?;

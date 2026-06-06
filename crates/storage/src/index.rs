@@ -53,13 +53,15 @@ pub struct BTreeIndex<K: Key, V: Value> {
 impl<K: Key, V: Value> BTreeIndex<K, V> {
     // ── Constructors ──────────────────────────────────────────────────────────
 
-    pub fn open(pool: Arc<BufferPoolManager>, root_id: PageId) -> Self {
-        Self {
-            pool,
-            root: Mutex::new(root_id),
-            _key: PhantomData,
-            _val: PhantomData,
-        }
+    pub fn open(pool: Arc<BufferPoolManager>) -> Result<Self> {
+        // Page 0 is the superblock. fetch_page verifies its checksum, so a torn
+        // write surfaces here as BufferPoolError::PageCorruption.
+        let meta = pool.fetch_page(0)?;
+        let root = crate::page::meta::read_root(&meta[..]).ok_or_else(|| {
+            IndexError::CorruptMetadata("page 0 is not a FluxDB superblock".into())
+        })?;
+        drop(meta);
+        Ok(Self::from_root(pool, root))
     }
 
     /// Reclaims storage space by physically removing dead record versions.
@@ -96,15 +98,34 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
     }
 
     pub fn create(pool: Arc<BufferPoolManager>) -> Result<(Self, PageId)> {
-        let mut guard = pool.new_page()?;
-        let page_id = guard.page_id;
-        LeafPageBuilder::<K, V>::new(page_id, &mut guard[..]);
-        drop(guard);
-        Ok((Self::open(pool, page_id), page_id))
+        let mut meta_guard = pool.new_page()?;
+        let meta_pid = meta_guard.page_id;
+        // create root page first
+        let mut root_guard = pool.new_page()?;
+        let root_pid = root_guard.page_id;
+        LeafPageBuilder::<K, V>::new(root_pid, &mut root_guard[..]);
+        drop(root_guard);
+        // Make the root durable BEFORE the superblock that points to it, so a
+        // crash can never leave page 0 referencing a not-yet-written root page.
+        pool.flush_page(root_pid)?;
+        crate::page::meta::init(&mut meta_guard[..], root_pid);
+        drop(meta_guard);
+        pool.flush_page(meta_pid)?;
+
+        Ok((Self::from_root(pool, root_pid), root_pid))
     }
 
     pub fn root_page_id(&self) -> PageId {
         *self.root.lock().unwrap()
+    }
+
+    fn from_root(pool: Arc<BufferPoolManager>, root: PageId) -> Self {
+        Self {
+            pool,
+            root: Mutex::new(root),
+            _val: PhantomData,
+            _key: PhantomData,
+        }
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -860,6 +881,13 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 drop(new_root_guard);
 
                 *self.root.lock().unwrap() = new_root_pid;
+                // updating new root in metadata page
+                {
+                    let mut meta = self.pool.fetch_page_mut(0)?;
+                    //TODO: Integrate this with WAL later
+                    crate::page::meta::set_root(&mut meta[..], new_root_pid);
+                } // drops the meta guard before flush_page(0)
+                self.pool.flush_page(0)?;
                 return Ok(());
             }
 
@@ -1159,6 +1187,60 @@ mod tests {
         let got = idx.get(&(&b"k"[..]), &auto()).unwrap();
         assert!(got.is_some(), "get returned None after insert-after-delete");
         assert_eq!(got.unwrap(), b"v2");
+    }
+
+    // ── Reopen / metadata page ───────────────────────────────────────────
+
+    #[test]
+    fn reopen_recovers_root_and_data() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("reopen.db");
+
+        // Create, insert enough to force splits (incl. a root split), flush, close.
+        {
+            let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+            let pool = Arc::new(BufferPoolManager::new(disk));
+            let (index, _root) =
+                BTreeIndex::<&'static [u8], &'static [u8]>::create(pool.clone()).unwrap();
+            for k in 0u32..300 {
+                let key = leak_bytes(&k.to_be_bytes());
+                let val = leak_bytes(&(k * 7).to_be_bytes());
+                index.insert(&key, &val, &auto()).unwrap();
+            }
+            pool.flush_all_pages().unwrap();
+        }
+
+        // Reopen with NO root id — it must be recovered from the page-0 superblock.
+        let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+        let pool = Arc::new(BufferPoolManager::new(disk));
+        let index = BTreeIndex::<&'static [u8], &'static [u8]>::open(pool).unwrap();
+        for k in 0u32..300 {
+            let key = leak_bytes(&k.to_be_bytes());
+            let expected = (k * 7).to_be_bytes();
+            let got = index.get(&key, &auto()).unwrap();
+            assert_eq!(
+                got.as_deref(),
+                Some(&expected[..]),
+                "key {k} wrong after reopen"
+            );
+        }
+    }
+
+    #[test]
+    fn reopen_after_create_makes_root_durable() {
+        // `create` alone (no inserts, no flush_all) must make BOTH the superblock
+        // and the root page durable — otherwise a cold reopen can't find the root.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("fresh.db");
+        {
+            let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+            let pool = Arc::new(BufferPoolManager::new(disk));
+            let _ = BTreeIndex::<&'static [u8], &'static [u8]>::create(pool).unwrap();
+        }
+        let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+        let pool = Arc::new(BufferPoolManager::new(disk));
+        let index = BTreeIndex::<&'static [u8], &'static [u8]>::open(pool).unwrap();
+        assert!(index.get(&(&b"anything"[..]), &auto()).unwrap().is_none());
     }
 
     // ── Sequential inserts / splits ──────────────────────────────────────

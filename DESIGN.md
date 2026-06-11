@@ -222,6 +222,19 @@ Not record types:
   before the structural FPI that names the page; otherwise
   `1 + max page_id touched` already recovers the counter and it can be
   dropped from v1.
+- The third page in `LeafSplit` (the old right-neighbor's `prev_page` fix)
+  is the *backward* chain, which carries **no crash invariant** — only
+  rightlinks are load-bearing for search correctness. Folding it into the
+  atomic FPI set keeps it tidy; a torn backward link would not corrupt search.
+
+> **Is the standalone `Fpi` (type 13) needed?** Every page mutation already
+> produces a typed record that can carry `HAS_FPI` on its block, so a separate
+> `Fpi` type only earns its place for a page dirtied with **no logical
+> record** — e.g. a per-tuple status-hint write that changes bytes but logs
+> nothing (PostgreSQL's `XLOG_FPI_FOR_HINT`). FluxDB has no such unlogged page
+> change today; type 13 is **redundant until one exists** (the Phase-8
+> hint-bit idea would be exactly that consumer). Name the unlogged-write path
+> or drop the type before building it.
 
 **Scope:** v1 = `Insert`/`SetXmax`/`Commit`/`Abort`/`LeafSplit`/
 `InternalSplit`/`InsertDownlink`/`NewRoot`/`PageAllocate`/`PageCompact`/`Fpi`.
@@ -279,20 +292,33 @@ page id, and `next_page_id`.
 ### 4.4 LSN allocation, FlushedLSN, torn tails
 
 - `Wal` holds `lsn: AtomicU64`; `append` claims via `fetch_add` and returns
-  the assigned LSN. On open, scan resumes the counter at `max_lsn + 1`.
+  the assigned LSN. On open, scan resumes the counter at `max_lsn + 1`; an
+  existing-but-empty file resumes at `0`, consistent with a missing file.
 - The WAL tracks **`FlushedLSN`** (highest durable LSN). `flush_up_to(lsn)`
   fsyncs and advances it (no-op when already durable). WAL-before-page and
   commit durability both compare against it.
 - **Tail/corruption classification is by position, not error kind.** The CRC
   sits at a record's *end*, so a torn final record surfaces as a checksum
-  mismatch, not EOF. Rule: a bad CRC / unknown type / short read **at the
-  physical tail** (nothing valid parses after it, checked by bounded
-  resync look-ahead at `rec_len` boundaries) = recoverable torn tail —
-  truncate at the last good boundary and resume. The same error **with a
-  validly-parsing record after it** = real mid-log corruption — refuse to
-  open. Never skip-and-continue past damage.
+  mismatch, not EOF. A bad CRC / unknown type / short read **at the physical
+  tail** = recoverable torn tail — truncate at the last good boundary and
+  resume. The same damage **with valid records after it** = real mid-log
+  corruption — refuse to open. Never skip-and-continue past damage.
 - `append` validates payload shape per type and rejects malformed input
   (`InvalidRecord`); all length reads are bounded by `rec_len`.
+
+> **⚠ DECISION PENDING — how "is anything valid after it?" is decided.** A
+> bounded resync look-ahead at `rec_len` boundaries is **not reliably
+> decidable** in a pure byte stream — if `rec_len` itself is corrupt there is
+> no anchor to resync on. Resolve before building recovery, one of two ways:
+> **(a) add a resync anchor** — a record-start magic and/or a `prev_lsn`
+> back-pointer chain (PostgreSQL's `xl_prev`; not needed for redo, but exactly
+> what makes tail-vs-mid-log decidable), or **(b) keep the plain byte stream
+> and simplify the rule** — in a single-appender append-only log a torn write
+> can only be at the tail, so: first bad CRC ⇒ truncate and resume, and any
+> damage that *can* be shown to be mid-log (e.g. by file length) ⇒ **halt
+> loudly, never silently truncate** (silent truncation discards committed
+> transactions). Pick (a) for robustness or (b) for simplicity; do **not**
+> ship the optimistic look-ahead middle ground.
 
 ### 4.5 Deferred performance work (correctness first)
 
@@ -305,6 +331,13 @@ buffer** (slot reservation → lock-free `fetch_add` with hole/ready-bitmask
 tracking, cache-line-padded atomics); backpressure via the bounded buffer.
 Sharded WALs and replication are out of scope for a single node.
 
+One caveat that is *not* purely performance: **without segmentation the WAL is
+a single ever-growing file with no physical reclamation mechanism** — §7.3's
+"delete WAL before the redo point" has nothing to delete *with*. Checkpoints
+bound where replay *starts*, not the physical log size. Until segments (or
+periodic file rewrite) exist, disk use grows monotonically; recovery time is
+still bounded by the redo point.
+
 ---
 
 ## 5. Cross-cutting invariants
@@ -314,6 +347,17 @@ Sharded WALs and replication are out of scope for a single node.
    (`write_frame_to_disk`, flush *and* eviction): read the frame's page LSN,
    `wal.flush_up_to(page_lsn)`, then write. Any other page-writer must route
    through this seam.
+   **No data fsync on the eviction path.** WBL requires the *log* durable
+   before the page write — not the data file. The page itself must be durable
+   only by the time a checkpoint advances the redo point past its changes, so
+   the data-file fsync is **batched at the checkpoint** (§7.3 step 3); an
+   evicted page sits in the OS page cache until then. A per-eviction fsync
+   forces a device flush on every frame replacement and destroys throughput.
+   *Sequencing caveat:* today `write_frame_to_disk` calls `sync_data()` on
+   every write, and pre-WAL that fsync is the **only** durability the engine
+   has — it may be dropped **only once** the WAL exists *and* the checkpoint
+   performs the batched data fsync; otherwise an evicted dirty page can be
+   lost with no redo source to replay it.
 2. **Page-LSN stamping & gating.** Every mutation stamps
    `page.set_lsn(record.lsn)` at the mutation site (the only place the LSN is
    known). Redo applies a record to a block **iff `record.lsn > page.lsn`**.
@@ -439,6 +483,18 @@ pass**:
   the linearization point, re-descend for the parent stack,
   insert-separator-if-absent; redo of `InsertDownlink` likewise
   insert-if-absent. (Read/delete descents build no parent stack today.)
+
+  **Latch-order rule for whatever protocol is chosen:** never hold a
+  descendant latch while acquiring an ancestor outside the established
+  bottom-up split-propagation order — that inverts the descend-only
+  discipline the tree relies on. The safe pattern (PostgreSQL's
+  `_bt_insert_parent`): release the child latch, relocate the parent via the
+  right-link / parent stack, then latch the parent and
+  insert-the-separator-if-absent. Known fragility to clean up when this is
+  built: `split_and_insert`'s left-target branch (`index.rs:743–746`)
+  currently holds the leaf latch across the parent fetch inside
+  `insert_separator_via_stack` — safe today only because everything else is
+  strictly bottom-up.
 - **Page deletion** (crash between `MarkHalfDead` and `UnlinkPage`): the next
   vacuum pass completes it. Recycling is horizon-gated (§8.5), so a deleted
   page is never handed out mid-recovery.
@@ -454,6 +510,17 @@ driven from the mutation site** (a `mark_dirty(lsn)` where the record's LSN is
 known — not from the write-guard's deref, which has no LSN). The **redo
 point** = min `rec_lsn` over dirty frames at checkpoint start; if none dirty,
 the checkpoint's own LSN.
+
+**The first-dirty FPI decision is the same edge — implement one hook.** A
+page-touching record attaches an FPI to its block on the first modification
+of that page since the last checkpoint, for torn-write protection. The test
+is **old `page.lsn <= redo_point`** (the page hasn't been full-page-imaged
+since the checkpoint — PostgreSQL's `RedoRecPtr` check), and the clean→dirty
+edge is the one place where the *old* `page.lsn` and the new record's LSN are
+both known. So `mark_dirty(lsn)` has two outputs on a clean→dirty transition:
+record `rec_lsn = lsn`, and decide the FPI by comparing the prior `page.lsn`
+against the current redo point. The FPI mechanism and the recLSN mechanism
+are not independent — they are two outputs of this one edge.
 
 ### 7.2 The status guard (commit/abort vs checkpoint)
 
@@ -477,11 +544,16 @@ equivalent of PostgreSQL's `DELAY_CHKPT_IN_COMMIT` interlock.)
      pinned_aborted[], vacuum_horizon, root_pid, next_page_id
    release guard
 2. append Checkpoint record; flush WAL
-3. flush all currently-dirty pages (WBL-honoring; don't block writers)
+3. write all currently-dirty pages (WBL-honoring; don't block writers),
+   then ONE batched data-file fsync for the whole set
 4. atomically update the superblock checkpoint pointer
    (atomic_write_file: temp + fsync + rename + dir-fsync)
 5. delete/recycle WAL strictly before redo_point
 ```
+
+- Step 3's **single batched fsync** is what licenses the no-fsync eviction
+  path (§5.1): it guarantees every page dirtied since the last checkpoint is
+  durable before the redo point advances past its records.
 
 - A crash before step 4 leaves the previous checkpoint authoritative; the new
   Checkpoint record is just an unreferenced (or torn-tail) record. A crash
@@ -586,12 +658,33 @@ bumps the high-water mark; `next_page_id` persists via the checkpoint. A run
 of trailing free pages may be truncated off the file (lower priority — space
 is reused internally without it).
 
-### 8.6 Autovacuum (later)
+### 8.6 Vacuum concurrency
+
+- Vacuum holds **one exclusive leaf latch at a time**; between pages it holds
+  none — no deadlock, foreground writers proceed on other pages.
+- Following `rightlink` is stable under concurrent splits: a page inserted
+  ahead of the cursor is simply visited later; nothing is lost.
+- Empty-page deletion (§8.5) is the one place touching >1 page; it must use
+  the right-link + half-dead protocol, never naive multi-latching.
+
+### 8.7 Autovacuum (later)
 
 Dead-tuple counter as trigger; bounded batches with a resumable cursor;
 cost-based sleep between batches; stats (pages scanned, versions reclaimed).
 A per-page "nothing to reclaim" bit (visibility-map analog) lets vacuum skip
 clean pages — pure performance, defer.
+
+> **Operational hazard: a long-running or idle transaction pins
+> `global_xmin`.** A single long-lived or abandoned transaction holds the
+> horizon back, which stalls **vacuum** (nothing newer becomes reclaimable),
+> **CLOG truncation** (both tiers trail the horizon), and therefore the
+> **`pinned_aborted[]` set grows** in every checkpoint. Note what it does
+> *not* pin under this design: **WAL retention** — the redo point is min
+> recLSN over dirty frames, independent of `global_xmin` (this is a benefit
+> of the §3.4 design; under WAL-derived CLOG it would have pinned the log
+> too). Mitigations a production engine needs: surface the oldest-active-txn
+> age as a stat at minimum; optionally an old-snapshot age threshold that
+> cancels offenders.
 
 ---
 
@@ -615,7 +708,11 @@ Key unit-level tests alongside: vacuum removes aborted-xmin versions; keeps
 versions visible to active snapshots; committed-entry truncation keeps old
 committed data visible; aborted-entry truncation after a full sweep keeps
 aborted data invisible; recycled pages not reused while a reader is active;
-pre-split cleanup avoids splits under version churn.
+pre-split cleanup avoids splits under version churn;
+`recovery_reuses_no_txn_id` (an in-flight txn that wrote tuples but never
+settled must not have its id reissued after restart — the §6.3 watermark);
+`recovery_torn_tail_opens` (a DB whose last record is torn opens and
+recovers; mid-log damage halts — §4.4).
 
 ---
 
@@ -649,3 +746,28 @@ Build order (each step one issue):
    strategy.
 8. **Performance**: group commit, segmentation, concurrent WAL buffer (§4.5);
    insert fastpath, prefetch, bulk-load rebuild, overflow pages.
+
+---
+
+## 11. Appendix: PostgreSQL reference mapping
+
+For implementers familiar with PostgreSQL internals. Structural records mirror
+`nbtree` (`src/include/access/nbtxlog.h`; replay in `nbtxlog.c::btree_redo`):
+
+- `SPLIT_L`/`SPLIT_R` → `LeafSplit`/`InternalSplit`
+- `INSERT_UPPER` → `InsertDownlink`
+- `NEWROOT` → `NewRoot`
+- `VACUUM`/`DELETE` → `PageCompact`
+- `MARK_PAGE_HALFDEAD`/`UNLINK_PAGE` → `MarkHalfDead`/`UnlinkPage`
+- `REUSE_PAGE` → page recycle
+
+Transaction markers are a separate resource manager in PostgreSQL
+(`XLOG_XACT_COMMIT`/`_ABORT`, `access/xact.h`); checkpoints in
+`access/xlog.h`. FluxDB's MVCC `Insert`/`SetXmax` are conceptually the
+**heap** records (`XLOG_HEAP_INSERT`/`_DELETE`) folded onto a B+Tree leaf,
+because FluxDB is index-organized. Not adopted: `DEDUP` / `INSERT_POST` /
+`META_CLEANUP`. FluxDB's LSN is a logical counter where PostgreSQL's is the
+WAL byte offset (`pg_lsn`) — see the reconsideration note in §4.5. The
+checkpoint status guard (§7.2) is `DELAY_CHKPT_IN_COMMIT`; the durable CLOG
+seed (§3.4) replaces pg_xact, which FluxDB doesn't need thanks to u64 ids +
+presumed commit.

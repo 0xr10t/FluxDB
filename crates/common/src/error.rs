@@ -143,6 +143,8 @@ pub enum TypeNameError {
 pub enum EngineError {
     #[error("another database exists at that location")]
     AlreadyExists,
+    #[error("no database found at that location")]
+    NotFound,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("disk error: {0}")]

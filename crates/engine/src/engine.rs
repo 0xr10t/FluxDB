@@ -52,8 +52,32 @@ where
             transaction_manager,
         })
     }
-    // opens a existing database
+    // opens an existing database
     pub fn open(dir_path: impl AsRef<Path>) -> Result<Engine<K, V>, EngineError> {
-        todo!()
+        let path = dir_path.as_ref();
+        // the data file is the marker that a database lives here
+        if !path.join("data.db").exists() {
+            return Err(EngineError::NotFound);
+        }
+        let disk_manager = Arc::new(DiskManager::new(path.join("data.db"), PAGE_SIZE)?);
+        // Wal::new opens the existing log (and creates it if a pre-WAL database
+        // never had one) — the tail scan / LSN resume lands with the log manager work
+        let wal = Arc::new(Mutex::new(Wal::new(path.join("wal.log"))?));
+        let buffer_pool = Arc::new(BufferPoolManager::new(Arc::clone(&disk_manager)));
+        let transaction_manager = Arc::new(TransactionManager::new());
+        // recovery runs HERE — after the pool exists, before the index opens:
+        // read checkpoint from superblock → seed CLOG from pinned_aborted[] →
+        // replay WAL from redo_point → mark crash victims Aborted →
+        // inject next_txn_id / next_page_id watermarks (from_recovered)
+        // index reads the root page id from the page-0 superblock
+        let index = Arc::new(BTreeIndex::open(Arc::clone(&buffer_pool))?);
+        // TODO! spawn checkpoint + vacuum threads
+        Ok(Engine {
+            index,
+            wal,
+            buffer_pool,
+            disk_manager,
+            transaction_manager,
+        })
     }
 }

@@ -12,11 +12,11 @@ where
     K: Key,
     V: Value,
 {
-    index: Arc<BTreeIndex<K, V>>,
-    wal: Arc<Mutex<Wal>>,
-    disk_manager: Arc<DiskManager>,
-    buffer_pool: Arc<BufferPoolManager>,
-    transaction_manager: Arc<TransactionManager>,
+    pub(crate) index: Arc<BTreeIndex<K, V>>,
+    pub(crate) wal: Arc<Mutex<Wal>>,
+    pub(crate) disk_manager: Arc<DiskManager>,
+    pub(crate) buffer_pool: Arc<BufferPoolManager>,
+    pub(crate) transaction_manager: Arc<TransactionManager>,
 }
 
 impl<K, V> Engine<K, V>
@@ -80,4 +80,7 @@ where
             transaction_manager,
         })
     }
+
+
+    // implement close() when checkpoint lands. 
 }

@@ -147,7 +147,7 @@ impl TransactionManager {
     /// Once committed, the transaction's writes become eligible for visibility
     /// to new snapshots. Any threads waiting on this transaction via
     /// `wait_until_settled` are woken up.
-    pub fn commit(&self, txn_id: u64) {
+    pub fn mark_committed(&self, txn_id: u64) {
         self.clog
             .write()
             .unwrap()
@@ -159,7 +159,7 @@ impl TransactionManager {
     /// Marks a transaction as aborted in the CLOG and removes it from the active set.
     ///
     /// Any threads waiting on this transaction via `wait_until_settled` are woken up.
-    pub fn abort(&self, txn_id: u64) {
+    pub fn mark_aborted(&self, txn_id: u64) {
         self.clog
             .write()
             .unwrap()
@@ -277,7 +277,7 @@ mod tests {
         let tm = std::sync::Arc::new(TransactionManager::new());
         let txn = tm.begin();
 
-        tm.commit(txn.txn_id);
+        tm.mark_committed(txn.txn_id);
 
         assert!(!tm.is_active(txn.txn_id));
         assert!(tm.is_committed(txn.txn_id));
@@ -289,7 +289,7 @@ mod tests {
         let tm = std::sync::Arc::new(TransactionManager::new());
         let txn = tm.begin();
 
-        tm.abort(txn.txn_id);
+        tm.mark_aborted(txn.txn_id);
 
         assert!(!tm.is_active(txn.txn_id));
         assert!(!tm.is_committed(txn.txn_id));
@@ -329,7 +329,7 @@ mod tests {
         let txn3 = tm.begin();
 
         // Commit txn2 in the middle
-        tm.commit(txn2.txn_id);
+        tm.mark_committed(txn2.txn_id);
 
         let snap = tm.get_snapshot();
 
@@ -346,7 +346,7 @@ mod tests {
     fn wait_until_settled_returns_immediately_if_already_committed() {
         let tm = std::sync::Arc::new(TransactionManager::new());
         let txn = tm.begin();
-        tm.commit(txn.txn_id);
+        tm.mark_committed(txn.txn_id);
         // Must return without blocking — transaction already settled.
         tm.wait_until_settled(txn.txn_id);
     }
@@ -355,7 +355,7 @@ mod tests {
     fn wait_until_settled_returns_immediately_if_already_aborted() {
         let tm = std::sync::Arc::new(TransactionManager::new());
         let txn = tm.begin();
-        tm.abort(txn.txn_id);
+        tm.mark_aborted(txn.txn_id);
         tm.wait_until_settled(txn.txn_id);
     }
 
@@ -378,7 +378,7 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         assert!(!waiter.is_finished(), "waiter should be blocked");
 
-        tm.commit(blocker_id);
+        tm.mark_committed(blocker_id);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while !waiter.is_finished() {
@@ -409,7 +409,7 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         assert!(!waiter.is_finished(), "waiter should be blocked");
 
-        tm.abort(blocker_id);
+        tm.mark_aborted(blocker_id);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while !waiter.is_finished() {
@@ -442,7 +442,7 @@ mod tests {
             .collect();
 
         thread::sleep(Duration::from_millis(20));
-        tm.commit(blocker_id);
+        tm.mark_committed(blocker_id);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         for handle in handles {
@@ -472,7 +472,7 @@ mod tests {
         // Give the waiter time to register its entry in the map.
         thread::sleep(Duration::from_millis(20));
 
-        tm.commit(blocker_id);
+        tm.mark_committed(blocker_id);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while !waiter.is_finished() {

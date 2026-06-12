@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn vacuumable_aborted_creator() {
         let tm = TransactionManager::new();
-        tm.abort(5); // xmin=5 aborted
+        tm.mark_aborted(5); // xmin=5 aborted
         // Creator aborted -> always dead
         assert!(is_vacuumable(5, 0, 100, &tm));
         assert!(is_vacuumable(5, 15, 10, &tm));
@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn vacuumable_committed_deleter_below_horizon() {
         let tm = TransactionManager::new();
-        tm.commit(15); // xmax=15 committed
+        tm.mark_committed(15); // xmax=15 committed
         // xmax=15 < horizon=20 -> dead
         assert!(is_vacuumable(5, 15, 20, &tm));
     }
@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn vacuumable_committed_deleter_above_horizon_is_live() {
         let tm = TransactionManager::new();
-        tm.commit(15); // xmax=15 committed
+        tm.mark_committed(15); // xmax=15 committed
         // xmax=15 >= horizon=10 -> live (someone might still see the old version)
         assert!(!is_vacuumable(5, 15, 10, &tm));
     }

@@ -164,7 +164,8 @@ impl Iterator for WalIterator {
 }
 
 impl WalIterator {
-    pub fn new(path: &Path) -> io::Result<WalIterator> {
+    pub fn new(path: impl AsRef<Path>) -> io::Result<WalIterator> {
+        let path = path.as_ref();
         let file = OpenOptions::new().read(true).open(path)?;
         Ok(WalIterator {
             reader: BufReader::new(file),
@@ -173,7 +174,8 @@ impl WalIterator {
 }
 
 impl Wal {
-    pub fn new(path: &Path) -> Result<Self> {
+    pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Wal {
             path: path.to_path_buf(),

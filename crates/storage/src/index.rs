@@ -20,7 +20,6 @@ use crate::page::{
     LeafPageAccessor, LeafPageBuilder, LeafPageMutator, PageId,
 };
 use common::IndexError;
-
 use db_core::transaction::Transaction;
 
 pub type Result<T> = std::result::Result<T, IndexError>;

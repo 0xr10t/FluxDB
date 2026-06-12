@@ -1,7 +1,7 @@
 use crate::engine::Engine;
+use crate::txn::TxnHandle;
 use common::{EngineError, IndexError, Key, Value};
 use db_core::transaction::Transaction;
-use crate::txn::TxnHandle; 
 impl<K, V> Engine<K, V>
 where
     K: Key,
@@ -45,7 +45,6 @@ where
         self.index.update(key, value, txn).map_err(map_conflict)
     }
 }
-
 
 fn map_conflict(e: IndexError) -> EngineError {
     match e {

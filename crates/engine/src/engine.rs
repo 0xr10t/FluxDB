@@ -156,7 +156,7 @@ where
         TxnHandle {
             engine: self,
             txn: Some(self.transaction_manager.begin()),
-            poisoned: false 
+            poisoned: false,
         }
     }
 }

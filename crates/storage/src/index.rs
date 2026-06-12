@@ -1098,11 +1098,11 @@ mod tests {
             .clone();
 
         static TEST_TXN_ID: AtomicU64 = AtomicU64::new(1);
-        Transaction {
-            txn_id: TEST_TXN_ID.fetch_add(1, Relaxed),
-            snapshot: db_core::transaction::Snapshot::latest(),
+        Transaction::new(
+            TEST_TXN_ID.fetch_add(1, Relaxed),
+            db_core::transaction::Snapshot::latest(),
             tm,
-        }
+        )
     }
 
     fn leak_bytes(b: &[u8]) -> &'static [u8] {
@@ -1407,7 +1407,7 @@ mod tests {
         // 1. Insert a key.
         let insert_txn = tm.begin();
         idx.insert(&(&b"k"[..]), &(&b"v"[..]), &insert_txn).unwrap();
-        tm.commit(insert_txn.txn_id);
+        tm.mark_committed(insert_txn.txn_id);
 
         // 2. Start txn10 and delete the key.
         let txn10 = tm.begin();
@@ -1432,7 +1432,7 @@ mod tests {
             let k = i.to_be_bytes();
             let txn = tm.begin();
             idx.insert(&(k.as_ref()), &(k.as_ref()), &txn).unwrap();
-            tm.commit(txn.txn_id);
+            tm.mark_committed(txn.txn_id);
         }
 
         // 2. Delete 50 keys and commit.
@@ -1440,7 +1440,7 @@ mod tests {
             let k = i.to_be_bytes();
             let txn = tm.begin();
             idx.delete(&(k.as_ref()), &txn).unwrap();
-            tm.commit(txn.txn_id);
+            tm.mark_committed(txn.txn_id);
         }
 
         // 3. Run vacuum. Since all transactions committed, it should reclaim 50 records.

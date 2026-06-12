@@ -36,9 +36,21 @@ pub struct Transaction {
     pub snapshot: Snapshot,
     /// The manager tracking commit log entries for visibility checking.
     pub tm: Arc<TransactionManager>,
+    pub(crate) wrote_anything: bool,
 }
 
 impl Transaction {
+    /// Builds a fresh transaction. The single construction point — keeps the
+    /// write-tracking flag (`wrote_anything`) private and always-initialized.
+    pub fn new(txn_id: u64, snapshot: Snapshot, tm: Arc<TransactionManager>) -> Self {
+        Transaction {
+            txn_id,
+            snapshot,
+            tm,
+            wrote_anything: false,
+        }
+    }
+
     /// Determines whether a record with `(rec_xmin, rec_xmax)` is visible to
     /// this transaction.
     pub fn is_visible(&self, rec_xmin: u64, rec_xmax: u64) -> bool {
@@ -59,6 +71,14 @@ impl Transaction {
     /// perspective?
     pub fn is_in_progress(&self, txn_id: u64) -> bool {
         self.snapshot.is_in_progress(txn_id, &self.tm)
+    }
+
+    pub fn note_write(&mut self) {
+        self.wrote_anything = true;
+    }
+
+    pub fn wrote_anything(&self) -> bool {
+        return self.wrote_anything;
     }
 }
 

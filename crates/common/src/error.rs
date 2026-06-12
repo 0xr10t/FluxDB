@@ -155,4 +155,6 @@ pub enum EngineError {
     BufferPool(#[from] BufferPoolError),
     #[error("index error: {0}")]
     Index(#[from] IndexError),
+    #[error("write conflict: the transaction was aborted and may be retried")]
+    TransactionConflict,
 }

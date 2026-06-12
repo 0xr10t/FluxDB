@@ -7,6 +7,8 @@ use storage::disk::DiskManager;
 use storage::index::BTreeIndex;
 use storage::page::PAGE_SIZE;
 use storage::wal::Wal;
+
+use crate::txn::TxnHandle;
 pub struct Engine<K, V>
 where
     K: Key,
@@ -81,6 +83,80 @@ where
         })
     }
 
+    // implement close() when checkpoint lands.
 
-    // implement close() when checkpoint lands. 
+    // ── PUBLIC API ─────────────────────────────────────────────
+    pub fn insert(
+        &self,
+        key: &K::SelfType<'_>,
+        value: &V::SelfType<'_>,
+    ) -> Result<(), EngineError> {
+        let mut txn = self.transaction_manager.begin();
+        match self.insert_in(&mut txn, key, value) {
+            Ok(()) => {
+                self.commit(txn);
+                Ok(())
+            }
+            Err(e) => {
+                self.abort(txn);
+                Err(e)
+            }
+        }
+    }
+
+    pub fn get(&self, key: &K::SelfType<'_>) -> Result<Option<Vec<u8>>, EngineError> {
+        // reads still need a transaction: the snapshot from begin() is what
+        // makes the read correct; its commit hits the read-only fast path
+        let txn = self.transaction_manager.begin();
+        match self.get_in(&txn, key) {
+            Ok(v) => {
+                self.commit(txn);
+                Ok(v)
+            }
+            Err(e) => {
+                self.abort(txn);
+                Err(e)
+            }
+        }
+    }
+
+    pub fn update(
+        &self,
+        key: &K::SelfType<'_>,
+        value: &V::SelfType<'_>,
+    ) -> Result<(), EngineError> {
+        let mut txn = self.transaction_manager.begin();
+        match self.update_in(&mut txn, key, value) {
+            Ok(()) => {
+                self.commit(txn);
+                Ok(())
+            }
+            Err(e) => {
+                self.abort(txn);
+                Err(e)
+            }
+        }
+    }
+
+    pub fn delete(&self, key: &K::SelfType<'_>) -> Result<(), EngineError> {
+        let mut txn = self.transaction_manager.begin();
+        match self.delete_in(&mut txn, key) {
+            Ok(()) => {
+                self.commit(txn);
+                Ok(())
+            }
+            Err(e) => {
+                self.abort(txn);
+                Err(e)
+            }
+        }
+    }
+
+    pub fn begin(&self) -> TxnHandle<'_, K, V> {
+        TxnHandle {
+            engine: self,
+            txn: Some(self.transaction_manager.begin()),
+            poisoned: false 
+        }
+    }
 }

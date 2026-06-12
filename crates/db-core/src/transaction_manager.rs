@@ -139,6 +139,7 @@ impl TransactionManager {
                 active: active_vec,
             },
             tm: std::sync::Arc::clone(self),
+            wrote_anything: false,
         }
     }
 

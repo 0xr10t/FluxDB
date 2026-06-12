@@ -49,12 +49,61 @@ where
     V: Value
 {
     pub fn commit(mut self) -> Result<(), EngineError> {
-        if self.poisoned {};
+        if self.poisoned {
+            return Err(EngineError::TransactionConflict); // no need to call abort here as self will get dropped and abort is called inside drop impl itself. 
+        };
         if let Some(txn) = self.txn.take() {
             self.engine.commit(txn); 
         }
         Ok(())
     }
+
+    pub fn insert(&mut self, key: &K::SelfType<'_>, value: &V::SelfType<'_>) -> Result<(), EngineError> {
+        if self.poisoned {
+            return Err(EngineError::TransactionConflict); 
+        }
+        let txn = self.txn.as_mut().expect("this shouldn't be none in any possible case"); // Txn is none only on either committed or dropped 
+        let res = self.engine.insert_in(txn, key, value); 
+        if matches!(res, Err(EngineError::TransactionConflict)) {
+            self.poisoned = true;  //the whole txn is dead
+        }
+        res
+    }
+
+    pub fn delete(&mut self, key: &K::SelfType<'_>) -> Result<(), EngineError> {
+        if self.poisoned {
+            return Err(EngineError::TransactionConflict); 
+        }
+        let txn = self.txn.as_mut().expect("this shouldn't be none in any possible case"); // Txn is none only on either committed or dropped 
+        let res = self.engine.delete_in(txn, key); 
+        if matches!(res, Err(EngineError::TransactionConflict)) {
+            self.poisoned = true;  //the whole txn is dead
+        }
+        res
+    }
+
+    pub fn update(&mut self, key: &K::SelfType<'_>, value: &V::SelfType<'_>) -> Result<(), EngineError> {
+        if self.poisoned {
+            return Err(EngineError::TransactionConflict); 
+        }
+        let txn = self.txn.as_mut().expect("this shouldn't be none in any possible case"); // Txn is none only on either committed or dropped 
+        let res = self.engine.update_in(txn, key, value); 
+        if matches!(res, Err(EngineError::TransactionConflict)) {
+            self.poisoned = true;  //the whole txn is dead
+        }
+        res
+    }
+
+    pub fn get(&mut self, key: &K::SelfType<'_>) -> Result<Option<Vec<u8>>, EngineError> {
+        if self.poisoned {
+            return Err(EngineError::TransactionConflict); 
+        }
+        let txn = self.txn.as_ref().expect("this shouldn't be none in any possible case"); // Txn is none only on either committed or dropped 
+        let res = self.engine.get_in(txn, key); 
+        res
+    }
+
+    pub fn abort(self) {} // drop does the work here as well. 
 }
 
 impl<K: Key, V: Value> Drop for TxnHandle<'_, K, V> {

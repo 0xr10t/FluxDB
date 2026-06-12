@@ -7,3 +7,6 @@ edition = "2024"
 storage.workspace = true
 common.workspace = true
 db-core.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

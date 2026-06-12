@@ -998,8 +998,8 @@ mod tests {
     #[test]
     fn compact_removes_dead_records() {
         let tm = TransactionManager::new();
-        tm.commit(10); // deleter of record 1
-        tm.abort(20); // creator of record 2 (never valid)
+        tm.mark_committed(10); // deleter of record 1
+        tm.mark_aborted(20); // creator of record 2 (never valid)
 
         let mut buf = crate::page::PageBuffer::new();
         {

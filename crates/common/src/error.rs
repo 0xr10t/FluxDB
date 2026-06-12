@@ -137,3 +137,24 @@ pub enum TypeNameError {
     #[error("invalid UTF-8 in type name: {0}")]
     InvalidUtf8(#[from] std::str::Utf8Error),
 }
+
+// ==== ENGINE ERRORS =============================================================
+#[derive(Debug, Error)]
+pub enum EngineError {
+    #[error("another database exists at that location")]
+    AlreadyExists,
+    #[error("no database found at that location")]
+    NotFound,
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("disk error: {0}")]
+    Disk(#[from] DiskError),
+    #[error("WAL error: {0}")]
+    Wal(#[from] WalError),
+    #[error("buffer pool error: {0}")]
+    BufferPool(#[from] BufferPoolError),
+    #[error("index error: {0}")]
+    Index(#[from] IndexError),
+    #[error("write conflict: the transaction was aborted and may be retried")]
+    TransactionConflict,
+}

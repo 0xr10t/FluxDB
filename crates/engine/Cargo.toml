@@ -1,0 +1,12 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+storage.workspace = true
+common.workspace = true
+db-core.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

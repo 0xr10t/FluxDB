@@ -1,5 +1,4 @@
 use crate::engine::Engine;
-use crate::txn::TxnHandle;
 use common::{EngineError, IndexError, Key, Value};
 use db_core::transaction::Transaction;
 impl<K, V> Engine<K, V>

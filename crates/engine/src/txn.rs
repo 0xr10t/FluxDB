@@ -119,8 +119,7 @@ where
             .txn
             .as_ref()
             .expect("this shouldn't be none in any possible case"); // Txn is none only on either committed or dropped 
-        let res = self.engine.get_in(txn, key);
-        res
+        self.engine.get_in(txn, key)
     }
 
     pub fn abort(self) {} // drop does the work here as well.

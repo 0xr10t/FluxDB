@@ -78,7 +78,7 @@ impl Transaction {
     }
 
     pub fn wrote_anything(&self) -> bool {
-        return self.wrote_anything;
+        self.wrote_anything
     }
 }
 
